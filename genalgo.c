@@ -1,4 +1,4 @@
-/* Genetic algo, proof-of-concept (14/11/2005)
+/* Genetic algo, proof-of-concept (14/11/2005) */
 
 #include <stdio.h>
 #include <stdlib.h>

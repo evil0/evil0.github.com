@@ -30,7 +30,9 @@ int main(int argc, char **argv) {
 			*save,
 			*save_d;
 
-	if(argc==0) printf("usage: %s <magic number> <elements> <chromosomes> <length>\n", argv[0]); exit;
+	if(argc<3) { printf("usage: %s <magic number> <elements> [chromosomes] [length]\n", argv[0]);
+return -1;	
+} 
 	if(argc==4) CROM_NUMB = atoi(argv[3]);
 	if(argc==5) cifre = atoi(argv[4]);
 

